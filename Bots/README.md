@@ -1,4 +1,5 @@
 For ForsakenGenBot -
+
     Controls: 
         "Page Down": Complete a single generator puzzle
         "Page Up": Completes the entire generator by doing every puzzle back-to-back until complete.
