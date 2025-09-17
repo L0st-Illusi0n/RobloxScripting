@@ -12,7 +12,8 @@ echo Rebuilding using ForsakenGenBotGUI.spec...
 pyinstaller ForsakenGenBotGUI.spec --clean
 if errorlevel 1 goto :error
 
-echo Build completed successfully.
+echo Build completed seccessfully! Press any button to exit...
+pause >nul
 popd
 exit /b 0
 
