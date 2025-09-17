@@ -1,13 +1,82 @@
+# type: ignore[import]
 import ctypes
 import cv2
 import numpy as np
 import pyautogui
 import keyboard
 from collections import deque
+from threading import Event
 import interception
 import time, random
 
 interception.auto_capture_devices(keyboard=True, mouse=True)
+
+KILL_SWITCH_KEY = "delete"
+
+class KillSwitchActivated(Exception):
+    """Raised when the kill switch is engaged."""
+    pass
+
+
+kill_switch_event = Event()
+_kill_switch_handle = None
+
+
+def engage_kill_switch():
+    if kill_switch_event.is_set():
+        return
+    kill_switch_event.set()
+    try:
+        interception.mouse_up(button="left")
+        interception.mouse_up(button="right")
+    except Exception:
+        pass
+    print(f"Kill switch '{KILL_SWITCH_KEY}' engaged. Stopping mouse input.")
+
+
+def reset_kill_switch():
+    if kill_switch_event.is_set():
+        kill_switch_event.clear()
+
+
+def abort_if_killed():
+    if kill_switch_event.is_set():
+        raise KillSwitchActivated
+
+
+def _register_kill_switch_hotkey():
+    global _kill_switch_handle
+    if _kill_switch_handle is not None:
+        try:
+            keyboard.remove_hotkey(_kill_switch_handle)
+        except KeyError:
+            pass
+        _kill_switch_handle = None
+    try:
+        _kill_switch_handle = keyboard.add_hotkey(
+            KILL_SWITCH_KEY,
+            engage_kill_switch,
+            suppress=False,
+        )
+    except Exception as exc:
+        _kill_switch_handle = None
+        print(f"Failed to register kill switch hotkey '{KILL_SWITCH_KEY}': {exc}")
+
+
+def set_kill_switch_key(hotkey):
+    global KILL_SWITCH_KEY
+    normalized = hotkey.strip().lower()
+    if not normalized:
+        raise ValueError("Kill switch hotkey cannot be empty.")
+    KILL_SWITCH_KEY = normalized
+    _register_kill_switch_hotkey()
+
+
+def get_kill_switch_key():
+    return KILL_SWITCH_KEY
+
+
+_register_kill_switch_hotkey()
 
 SPEED = 1.25
 JITTER_SCALE = 1.2
@@ -42,20 +111,35 @@ def get_settings():
     }
 
 def scaled_sleep(base_time):
-    time.sleep(base_time * SPEED)
+    total = max(0.0, base_time * SPEED)
+    if total <= 0:
+        abort_if_killed()
+        return
+    deadline = time.time() + total
+    while True:
+        abort_if_killed()
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            break
+        time.sleep(min(0.05, remaining))
+    abort_if_killed()
 
 def move_to(x, y):
+    abort_if_killed()
     interception.move_to(int(x), int(y))
 
 def mouse_down():
+    abort_if_killed()
     x, y = get_cursor_pos()
     interception.mouse_down(button="left")
 
 def mouse_up():
+    abort_if_killed()
     x, y = get_cursor_pos()
     interception.mouse_up(button="left")
 
 def click(x=None, y=None, button="left", delay=0.05):
+    abort_if_killed()
     if x is None or y is None:
         x, y = get_cursor_pos()
     interception.click(int(x), int(y), button=button, delay=delay)
@@ -153,6 +237,7 @@ def smoothstep(t):
     return t * t * (3 - 2 * t)
 
 def smooth_move_to(target, duration=0.2, jitter=False):
+    abort_if_killed()
     start_x, start_y = get_cursor_pos()
     dx = target[0] - start_x
     dy = target[1] - start_y
@@ -162,6 +247,7 @@ def smooth_move_to(target, duration=0.2, jitter=False):
     delay = max(0.004, duration / max(1, steps))
     jitter_amount = max(0.0, JITTER_SCALE) * 0.7
     for step in range(1, steps + 1):
+        abort_if_killed()
         t = step / steps
         eased = smoothstep(t)
         x = start_x + dx * eased
@@ -171,6 +257,7 @@ def smooth_move_to(target, duration=0.2, jitter=False):
             y += random.uniform(-jitter_amount, jitter_amount)
         interception.move_to(int(x), int(y))
         scaled_sleep(delay)
+    abort_if_killed()
     interception.move_to(int(target[0]), int(target[1]))
 
 TOLERANCE = 5
@@ -546,17 +633,22 @@ def interpolate_segment(p1, p2, steps=12, curve=True):
 def drag_path(centers, hold=True):
     if not centers or len(centers) < 2:
         return
+    abort_if_killed()
     smooth_move_to(centers[0], duration=0.15 * SPEED, jitter=False)
     scaled_sleep(0.01)
     if hold:
+        abort_if_killed()
         mouse_down()
         scaled_sleep(0.005)
     for i in range(len(centers) - 1):
+        abort_if_killed()
         segment = interpolate_segment(centers[i], centers[i+1], steps=10)
         for j, (px, py) in enumerate(segment):
+            abort_if_killed()
             interception.move_to(px, py)
             scaled_sleep(0.0025 + random.uniform(-0.0005, 0.0005))
         if i < len(centers) - 2:
+            abort_if_killed()
             dx1 = centers[i+1][0] - centers[i][0]
             dy1 = centers[i+1][1] - centers[i][1]
             dx2 = centers[i+2][0] - centers[i+1][0]
@@ -567,18 +659,22 @@ def drag_path(centers, hold=True):
             scaled_sleep(random.uniform(0.01, 0.03))
     if hold:
         scaled_sleep(0.01)
+        abort_if_killed()
         mouse_up()
 
 def execute_single_path(cells, h_lines, v_lines, origin_x, origin_y):
     if len(cells) < 2:
         print("Path too short, skipping.")
         return
+    abort_if_killed()
     centers = path_pixel_centers(cells, h_lines, v_lines, origin_x, origin_y)
     drag_path(centers)
 
 def execute_all_paths(solutions, h_lines, v_lines, origin_x, origin_y):
+    abort_if_killed()
     remaining = dict(solutions)
     while remaining:
+        abort_if_killed()
         ordered = order_paths_nearest_mouse(remaining, h_lines, v_lines, origin_x, origin_y)
         if not ordered:
             break
@@ -603,68 +699,116 @@ def run_one_puzzle(return_debug=False, progress_callback=None):
         except Exception:
             pass
 
-    screenshot = capture_region()
-    bbox = find_puzzle_bbox(screenshot)
-    if not bbox:
-        print("Puzzle not found.")
-        _emit("no_puzzle", None)
-        return _result(False, None)
-    x, y, w, h = bbox
-    puzzle = screenshot[y:y + h, x:x + w]
-    _emit("puzzle_captured", puzzle.copy())
-    origin_x = SEARCH_REGION["left"] + x
-    origin_y = SEARCH_REGION["top"] + y
-    rows, cols, h_lines, v_lines, debug = detect_grid(puzzle)
-    debug_image = debug
-    _emit("grid_detected", debug.copy())
-    if rows <= 0 or cols <= 0:
-        print("Grid detection failed.")
-        _emit("grid_failed", debug.copy())
-        return _result(False, debug_image)
-    detected, color_map = detect_points(puzzle, rows, cols, h_lines, v_lines, debug)
-    debug_image = debug
-    _emit("points_detected", debug.copy())
-    print("\nDetected points:")
-    for d in detected:
-        print(f"Row {d[0]}, Col {d[1]} -> {d[2]}")
-    print(f"Total unique paths needed: {len(color_map)}")
-    solutions = solve_paths_flexible(rows, cols, detected)
-    if solutions:
-        preview = debug.copy()
-        draw_paths(preview, solutions, h_lines, v_lines, color_map)
-        debug_image = preview.copy()
-        _emit("paths_ready", preview.copy())
-        for color, path in solutions.items():
-            print(f"Path for {color}: {path}")
-        execute_all_paths(solutions, h_lines, v_lines, origin_x, origin_y)
-    else:
-        print("Solver could not find a valid set of paths.")
-        _emit("no_solution", debug.copy())
-    print("Puzzle Complete/Canceled!")
-    return _result(True, debug_image)
+    debug_image = None
+
+    try:
+        screenshot = capture_region()
+        bbox = find_puzzle_bbox(screenshot)
+        if not bbox:
+            print("Puzzle not found.")
+            _emit("no_puzzle", None)
+            return _result(False, None)
+        x, y, w, h = bbox
+        puzzle = screenshot[y:y + h, x:x + w]
+        _emit("puzzle_captured", puzzle.copy())
+        origin_x = SEARCH_REGION["left"] + x
+        origin_y = SEARCH_REGION["top"] + y
+        rows, cols, h_lines, v_lines, debug = detect_grid(puzzle)
+        debug_image = debug
+        _emit("grid_detected", debug.copy())
+        if rows <= 0 or cols <= 0:
+            print("Grid detection failed.")
+            _emit("grid_failed", debug.copy())
+            return _result(False, debug_image)
+        detected, color_map = detect_points(puzzle, rows, cols, h_lines, v_lines, debug)
+        debug_image = debug
+        _emit("points_detected", debug.copy())
+        print("\nDetected points:")
+        for d in detected:
+            print(f"Row {d[0]}, Col {d[1]} -> {d[2]}")
+        print(f"Total unique paths needed: {len(color_map)}")
+        solutions = solve_paths_flexible(rows, cols, detected)
+        if solutions:
+            preview = debug.copy()
+            draw_paths(preview, solutions, h_lines, v_lines, color_map)
+            debug_image = preview.copy()
+            _emit("paths_ready", preview.copy())
+            for color, path in solutions.items():
+                print(f"Path for {color}: {path}")
+            execute_all_paths(solutions, h_lines, v_lines, origin_x, origin_y)
+        else:
+            print("Solver could not find a valid set of paths.")
+            _emit("no_solution", debug.copy())
+        print("Puzzle Complete/Canceled!")
+        return _result(True, debug_image)
+
+    except KillSwitchActivated:
+        print("Kill switch engaged. Canceling current puzzle.")
+        _emit("killed", None)
+        raise
 
 def main():
-    print("Ready. Press PgDn for one puzzle, PgUp for continuous mode. Press end to quit.")
+    print(f"Ready. Press PgDn for one puzzle, PgUp for continuous mode. Press end to quit. Press {KILL_SWITCH_KEY} to halt instantly.")
     while True:
-        key = keyboard.read_event(suppress=False).name
+        event = keyboard.read_event(suppress=False)
+        if getattr(event, "event_type", None) != keyboard.KEY_DOWN:
+            continue
+        key = getattr(event, "name", None)
+        if not key:
+            continue
+        key = key.lower()
+        if key == KILL_SWITCH_KEY:
+            continue
         if key == "page down":
             print("Running single puzzle...")
-            run_one_puzzle()
+            try:
+                reset_kill_switch()
+                run_one_puzzle()
+            except KillSwitchActivated:
+                print("Kill switch engaged. Single puzzle canceled.")
+                reset_kill_switch()
         elif key == "page up":
             print("Running continuous mode...")
             while True:
-                success = run_one_puzzle()
+                try:
+                    reset_kill_switch()
+                    success = run_one_puzzle()
+                except KillSwitchActivated:
+                    print("Kill switch engaged. Stopping continuous mode.")
+                    reset_kill_switch()
+                    break
                 if not success:
                     print("No puzzle detected, stopping continuous mode.")
                     print("Generator Complete/Canceled!")
                     break
-                scaled_sleep(0.35)
+                try:
+                    scaled_sleep(0.35)
+                except KillSwitchActivated:
+                    print("Kill switch engaged. Stopping continuous mode.")
+                    reset_kill_switch()
+                    break
                 if keyboard.is_pressed("end"):
+                    reset_kill_switch()
                     print("end pressed, stopping continuous mode.")
                     return
+            reset_kill_switch()
         elif key == "end":
             print("Exiting script.")
             break
-
 if __name__ == "__main__":
     main()
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
