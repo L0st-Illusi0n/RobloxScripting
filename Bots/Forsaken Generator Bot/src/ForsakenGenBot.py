@@ -7,9 +7,11 @@ from collections import deque
 import interception
 import time, random
 
-SPEED = 1.3 
-JITTER_SCALE = 1.0
-SMOOTHNESS = 1.0
+interception.auto_capture_devices(keyboard=True, mouse=True)
+
+SPEED = 1.25
+JITTER_SCALE = 1.2
+SMOOTHNESS = 0.8
 
 def set_speed(value):
     global SPEED
@@ -70,34 +72,15 @@ SEARCH_REGION = {
     "height": 800
 }
 
-COLORS = {
-    "Orange": (1, 111, 217),
-    "Blue": (217, 66, 16),
-    "Magenta": (189, 9, 199),
-    "LightBlue": (244, 210, 90),
-    "Pink": (142, 111, 247),
-    "White": (208, 234, 255),
-    "Green": (16, 217, 16),
-    "DarkBlue": (156, 0, 62),
-    "Yellow": (65, 180, 222),
-    "Red": (43, 16, 217),
-    "LightGreen": (103, 255, 102),
-    "LightPurple": (195, 149, 166),
-    "LightBrown": (145, 187, 199),
-    "HotPink": (231, 69, 225),
-    "Beige": (135, 214, 218),
-    "LightBeige": (191, 178, 136),
-    "BrightMagenta": (206, 82, 184),
-    "SandyTan": (136, 171, 185),
-    "ChartreuseGreen": (115, 234, 118),
-    "PaleYellow": (119, 232, 254),
-    "ModerateViolet": (248, 117, 189),
-    "Celadon": (196, 251, 156),
-    "SunYellow": (46, 255, 255),
-    "SpringGreen": (202, 252, 24),
-}
 
-TOLERANCE = 15
+# Tunables for dynamic color detection
+COLOR_DISTANCE_THRESHOLD = 45
+SATURATION_THRESHOLD = 60
+VALUE_THRESHOLD = 50
+BRIGHT_VALUE_THRESHOLD = 200
+MIN_POINT_PIXELS = 20
+CORE_CROP_RATIO = 0.25
+
 SW_RESTORE = 9
 user32 = ctypes.windll.user32
 kernel32 = ctypes.windll.kernel32
@@ -190,6 +173,8 @@ def smooth_move_to(target, duration=0.2, jitter=False):
         scaled_sleep(delay)
     interception.move_to(int(target[0]), int(target[1]))
 
+TOLERANCE = 5
+
 def color_match(pixel, target, tol=TOLERANCE):
     return all(abs(int(pixel[i]) - target[i]) <= tol for i in range(3))
 
@@ -248,28 +233,58 @@ def detect_grid(img):
 
 def detect_points(img, rows, cols, h_lines, v_lines, debug):
     detected = []
-    unique_colors = set()
+    color_clusters = []
+
+    def assign_label(mean_color):
+        for cluster in color_clusters:
+            if np.linalg.norm(mean_color - cluster['mean']) < COLOR_DISTANCE_THRESHOLD:
+                total = cluster['count'] + 1
+                cluster['mean'] = (cluster['mean'] * cluster['count'] + mean_color) / total
+                cluster['count'] = total
+                return cluster['label']
+        label = f"Flow{len(color_clusters) + 1}"
+        color_clusters.append({
+            'label': label,
+            'mean': mean_color.copy(),
+            'count': 1,
+        })
+        return label
+
     for i in range(rows):
         for j in range(cols):
             x1, x2 = v_lines[j], v_lines[j + 1]
             y1, y2 = h_lines[i], h_lines[i + 1]
             cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
             roi = img[y1:y2, x1:x2]
-            color_counts = {}
-            for cname, cval in COLORS.items():
-                mask = cv2.inRange(
-                    roi,
-                    np.array([max(0, cval[0] - TOLERANCE), max(0, cval[1] - TOLERANCE), max(0, cval[2] - TOLERANCE)]),
-                    np.array([min(255, cval[0] + TOLERANCE), min(255, cval[1] + TOLERANCE), min(255, cval[2] + TOLERANCE)]))
-                color_counts[cname] = cv2.countNonZero(mask)
-            best_color = max(color_counts, key=color_counts.get)
-            if color_counts[best_color] > 20:
-                detected.append((i, j, best_color))
-                unique_colors.add(best_color)
-                cv2.circle(debug, (cx, cy), 10, (0, 255, 0), 2)
-                cv2.putText(
-                    debug, best_color, (cx - 15, cy - 15), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255) ,1)
-    return detected, len(unique_colors)
+            if roi.size == 0:
+                continue
+            h, w = roi.shape[:2]
+            pad = int(round(min(h, w) * CORE_CROP_RATIO))
+            if pad > 0 and h > 2 * pad and w > 2 * pad:
+                core = roi[pad:h - pad, pad:w - pad]
+            else:
+                core = roi
+            if core.size == 0:
+                core = roi
+            hsv = cv2.cvtColor(core, cv2.COLOR_BGR2HSV)
+            sat = hsv[:, :, 1]
+            val = hsv[:, :, 2]
+            mask = ((sat > SATURATION_THRESHOLD) & (val > VALUE_THRESHOLD)) | (val > BRIGHT_VALUE_THRESHOLD)
+            count = int(np.count_nonzero(mask))
+            if count < MIN_POINT_PIXELS:
+                continue
+            pixels = core[mask]
+            if pixels.size == 0:
+                continue
+            mean_color = np.asarray(pixels.mean(axis=0), dtype=np.float32)
+            label = assign_label(mean_color)
+            detected.append((i, j, label))
+            color_bgr = tuple(int(round(c)) for c in mean_color)
+            cv2.circle(debug, (cx, cy), 10, color_bgr, 2)
+            cv2.putText(
+                debug, label, (cx - 20, cy - 15), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
+    color_map = {cluster['label']: tuple(int(round(c)) for c in cluster['mean']) for cluster in color_clusters}
+    return detected, color_map
 
 def manhattan(a, b):
     return abs(a[0] - b[0]) + abs(a[1] - b[1])
@@ -428,13 +443,13 @@ def solve_paths_flexible(rows, cols, detected):
             relaxed_solution[color] = found_path
     return relaxed_solution if relaxed_solution else None
 
-def draw_paths(debug_img, paths, h_lines, v_lines):
+def draw_paths(debug_img, paths, h_lines, v_lines, color_map):
     if not paths:
         return
     for color, cells in paths.items():
         if len(cells) < 2:
             continue
-        color_bgr = COLORS.get(color, (255, 255, 255))
+        color_bgr = color_map.get(color, (255, 255, 255))
         centers = []
         for r, c in cells:
             x1, x2 = v_lines[c], v_lines[c + 1]
@@ -606,17 +621,17 @@ def run_one_puzzle(return_debug=False, progress_callback=None):
         print("Grid detection failed.")
         _emit("grid_failed", debug.copy())
         return _result(False, debug_image)
-    detected, num_paths = detect_points(puzzle, rows, cols, h_lines, v_lines, debug)
+    detected, color_map = detect_points(puzzle, rows, cols, h_lines, v_lines, debug)
     debug_image = debug
     _emit("points_detected", debug.copy())
     print("\nDetected points:")
     for d in detected:
         print(f"Row {d[0]}, Col {d[1]} -> {d[2]}")
-    print(f"Total unique paths needed: {num_paths}")
+    print(f"Total unique paths needed: {len(color_map)}")
     solutions = solve_paths_flexible(rows, cols, detected)
     if solutions:
         preview = debug.copy()
-        draw_paths(preview, solutions, h_lines, v_lines)
+        draw_paths(preview, solutions, h_lines, v_lines, color_map)
         debug_image = preview.copy()
         _emit("paths_ready", preview.copy())
         for color, path in solutions.items():
