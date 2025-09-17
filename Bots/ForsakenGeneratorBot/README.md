@@ -17,4 +17,4 @@ It uses computer vision to detect the grid and endpoints, then simulates human-l
    Intercepter driver by Oblitum at: https://github.com/oblitum/Interception/releases
 3. Install the Intercepter driver by downloading the latest release and running the installer inside the "command line installer" folder using the following command:
    install-interception.exe /install
-   
+4. Run Build.bat and wait for the exe to finish building then can be accessed inside the "dist" folder it will create inside of the src folder.

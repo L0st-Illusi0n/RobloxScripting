@@ -20,4 +20,3 @@ exit /b 0
 echo Build failed. See PyInstaller output above for details.
 popd
 exit /b 1
-
