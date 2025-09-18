@@ -549,6 +549,72 @@ def draw_paths(debug_img, paths, h_lines, v_lines, color_map):
             cv2.circle(debug_img, centers[i], 6, color_bgr, -1)
         cv2.circle(debug_img, centers[-1], 6, color_bgr, -1)
 
+class PathProgressVisualizer:
+    def __init__(self, base_image, h_lines, v_lines, color_map, alpha=0.45):
+        try:
+            self.base_image = base_image.copy()
+        except AttributeError:
+            self.base_image = base_image
+        self.h_lines = list(h_lines)
+        self.v_lines = list(v_lines)
+        self.color_map = dict(color_map or {})
+        try:
+            alpha_value = float(alpha)
+        except (TypeError, ValueError):
+            alpha_value = 0.45
+        self.alpha = max(0.1, min(0.85, alpha_value))
+        self.completed = {}
+
+    def update_base(self, base_image):
+        if base_image is None:
+            return
+        try:
+            self.base_image = base_image.copy()
+        except AttributeError:
+            self.base_image = base_image
+
+    def _cell_bounds(self, row, col):
+        if row < 0 or col < 0:
+            return None
+        if row >= len(self.h_lines) - 1 or col >= len(self.v_lines) - 1:
+            return None
+        x1, x2 = self.v_lines[col], self.v_lines[col + 1]
+        y1, y2 = self.h_lines[row], self.h_lines[row + 1]
+        return x1, y1, x2, y2
+
+    def mark_cell(self, cell, color_label):
+        if cell is None or color_label is None:
+            return
+        self.completed[cell] = color_label
+
+    def snapshot(self, current_cell=None, current_color=None, label=None):
+        if self.base_image is None:
+            return None
+        canvas = self.base_image.copy()
+        overlay = np.zeros_like(canvas)
+        for (row, col), color_label in self.completed.items():
+            bounds = self._cell_bounds(row, col)
+            if bounds is None:
+                continue
+            x1, y1, x2, y2 = bounds
+            cell_color = self.color_map.get(color_label, (255, 255, 255))
+            cv2.rectangle(overlay, (x1, y1), (x2, y2), cell_color, -1)
+        cv2.addWeighted(overlay, self.alpha, canvas, 1 - self.alpha, 0, canvas)
+        if current_cell is not None:
+            bounds = self._cell_bounds(*current_cell)
+            if bounds is not None:
+                x1, y1, x2, y2 = bounds
+                highlight_color = self.color_map.get(current_color, (255, 255, 255))
+                accent = tuple(int(min(255, channel + 60)) for channel in highlight_color)
+                cv2.rectangle(canvas, (x1, y1), (x2, y2), accent, 2)
+        if label:
+            padding = 8
+            text_box_width = padding * 2 + int(len(label) * 9.5)
+            cv2.rectangle(canvas, (8, 8), (8 + text_box_width, 40), (0, 0, 0), -1)
+            cv2.putText(canvas, label, (12, 32), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1, cv2.LINE_AA)
+        return canvas
+
+
 def cell_center(row, col, h_lines, v_lines, origin_x, origin_y):
     x1 = origin_x + v_lines[col]
     x2 = origin_x + v_lines[col + 1]
@@ -630,7 +696,7 @@ def interpolate_segment(p1, p2, steps=12, curve=True):
         points.append((int(x), int(y)))
     return points
 
-def drag_path(centers, hold=True):
+def drag_path(color, cells, centers, hold=True, progress_callback=None, progress_visualizer=None):
     if not centers or len(centers) < 2:
         return
     abort_if_killed()
@@ -640,6 +706,28 @@ def drag_path(centers, hold=True):
         abort_if_killed()
         mouse_down()
         scaled_sleep(0.005)
+    total_steps = len(cells) if cells else 0
+
+    def send_progress(step_index):
+        if (
+            progress_callback is None
+            or progress_visualizer is None
+            or not cells
+            or step_index <= 0
+            or step_index > total_steps
+        ):
+            return
+        cell = cells[step_index - 1]
+        progress_visualizer.mark_cell(cell, color)
+        label = f"{color}: {step_index}/{total_steps}"
+        frame = progress_visualizer.snapshot(current_cell=cell, current_color=color, label=label)
+        try:
+            progress_callback(f"path_progress|{color}|{step_index}|{total_steps}", frame)
+        except Exception:
+            pass
+
+    if total_steps:
+        send_progress(1)
     for i in range(len(centers) - 1):
         abort_if_killed()
         segment = interpolate_segment(centers[i], centers[i+1], steps=10)
@@ -647,6 +735,8 @@ def drag_path(centers, hold=True):
             abort_if_killed()
             interception.move_to(px, py)
             scaled_sleep(0.0025 + random.uniform(-0.0005, 0.0005))
+        if total_steps:
+            send_progress(i + 2)
         if i < len(centers) - 2:
             abort_if_killed()
             dx1 = centers[i+1][0] - centers[i][0]
@@ -662,15 +752,24 @@ def drag_path(centers, hold=True):
         abort_if_killed()
         mouse_up()
 
-def execute_single_path(cells, h_lines, v_lines, origin_x, origin_y):
+
+def execute_single_path(color, cells, h_lines, v_lines, origin_x, origin_y, progress_callback=None, progress_visualizer=None):
     if len(cells) < 2:
         print("Path too short, skipping.")
         return
     abort_if_killed()
     centers = path_pixel_centers(cells, h_lines, v_lines, origin_x, origin_y)
-    drag_path(centers)
+    drag_path(
+        color,
+        cells,
+        centers,
+        hold=True,
+        progress_callback=progress_callback,
+        progress_visualizer=progress_visualizer,
+    )
 
-def execute_all_paths(solutions, h_lines, v_lines, origin_x, origin_y):
+
+def execute_all_paths(solutions, h_lines, v_lines, origin_x, origin_y, progress_callback=None, progress_visualizer=None):
     abort_if_killed()
     remaining = dict(solutions)
     while remaining:
@@ -682,8 +781,18 @@ def execute_all_paths(solutions, h_lines, v_lines, origin_x, origin_y):
         if entry_index == -1:
             path = list(reversed(path))
         print(f"Executing path for {color}...")
-        execute_single_path(path, h_lines, v_lines, origin_x, origin_y)
+        execute_single_path(
+            color,
+            path,
+            h_lines,
+            v_lines,
+            origin_x,
+            origin_y,
+            progress_callback=progress_callback,
+            progress_visualizer=progress_visualizer,
+        )
         del remaining[color]
+
 
 def run_one_puzzle(return_debug=False, progress_callback=None):
     def _result(success, debug_image=None):
@@ -723,6 +832,9 @@ def run_one_puzzle(return_debug=False, progress_callback=None):
         detected, color_map = detect_points(puzzle, rows, cols, h_lines, v_lines, debug)
         debug_image = debug
         _emit("points_detected", debug.copy())
+        progress_visualizer = None
+        if progress_callback is not None:
+            progress_visualizer = PathProgressVisualizer(debug.copy(), h_lines, v_lines, color_map)
         print("\nDetected points:")
         for d in detected:
             print(f"Row {d[0]}, Col {d[1]} -> {d[2]}")
@@ -733,9 +845,19 @@ def run_one_puzzle(return_debug=False, progress_callback=None):
             draw_paths(preview, solutions, h_lines, v_lines, color_map)
             debug_image = preview.copy()
             _emit("paths_ready", preview.copy())
+            if progress_visualizer is not None:
+                progress_visualizer.update_base(preview)
             for color, path in solutions.items():
                 print(f"Path for {color}: {path}")
-            execute_all_paths(solutions, h_lines, v_lines, origin_x, origin_y)
+            execute_all_paths(
+                solutions,
+                h_lines,
+                v_lines,
+                origin_x,
+                origin_y,
+                progress_callback=progress_callback,
+                progress_visualizer=progress_visualizer,
+            )
         else:
             print("Solver could not find a valid set of paths.")
             _emit("no_solution", debug.copy())

@@ -706,6 +706,20 @@ class ForsakenBotGUI:
         if stage == "killed":
             self._set_preview_status("Kill switch engaged.")
             return
+        if stage.startswith("path_progress"):
+            parts = stage.split("|")
+            color = parts[1] if len(parts) > 1 else None
+            step = parts[2] if len(parts) > 2 else None
+            total = parts[3] if len(parts) > 3 else None
+            if step and total and step.isdigit() and total.isdigit():
+                status = f"Drawing {color} ({step}/{total})" if color else f"Drawing path ({step}/{total})"
+            else:
+                status = f"Drawing {color}" if color else "Drawing path"
+            if image is not None:
+                self._update_preview_async(image, status)
+            else:
+                self._set_preview_status(status)
+            return
         message = stage_messages.get(stage)
         if stage == "paths_ready":
             if image is not None:
