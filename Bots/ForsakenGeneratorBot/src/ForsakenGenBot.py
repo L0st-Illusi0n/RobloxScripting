@@ -258,33 +258,133 @@ def find_puzzle_bbox(img):
     largest = max(contours, key=cv2.contourArea)
     return cv2.boundingRect(largest)
 
-def filter_lines(lines, tolerance=5):
-    if len(lines) < 2:
-        return lines
-    spacings = [lines[i + 1] - lines[i] for i in range(len(lines) - 1)]
-    spacing_counts = {}
+LINE_MERGE_GAP = 3
+MIN_EXPECTED_SPACING = 12 
+MAX_JUMP_MULTIPLIER = 2 
+def _merge_nearby_positions(positions, gap=LINE_MERGE_GAP):
+    if not positions:
+        return []
+    positions = sorted(positions)
+    merged = []
+    cluster = [positions[0]]
+    for p in positions[1:]:
+        if p - cluster[-1] <= gap:
+            cluster.append(p)
+        else:
+            merged.append(int(round(sum(cluster) / len(cluster))))
+            cluster = [p]
+    merged.append(int(round(sum(cluster) / len(cluster))))
+    return merged
+
+def _choose_expected_spacing(spacings, tolerance, min_spacing=MIN_EXPECTED_SPACING):
+    spacings = [s for s in spacings if s > max(tolerance, LINE_MERGE_GAP)]
+    if not spacings:
+        return None
+    bins = {}
     for s in spacings:
-        rounded = round(s / tolerance) * tolerance
-        spacing_counts[rounded] = spacing_counts.get(rounded, 0) + 1
-    expected_spacing = max(spacing_counts, key=spacing_counts.get)
-    filtered = [lines[0]]
-    for i in range(1, len(lines)):
-        if abs(lines[i] - filtered[-1] - expected_spacing) <= tolerance:
-            filtered.append(lines[i])
-    return filtered
+        b = round(s / tolerance) * tolerance
+        bins[b] = bins.get(b, 0) + 1
+    candidates = sorted(bins.items(), key=lambda kv: (-kv[1], -kv[0]))
+    for spacing, _count in candidates:
+        if spacing >= min_spacing:
+            return int(spacing)
+    spacings.sort()
+    mid = len(spacings) // 2
+    median = (spacings[mid] if len(spacings) % 2 else (spacings[mid - 1] + spacings[mid]) / 2)
+    return int(round(max(median, min_spacing)))
+
+def filter_lines(lines, tolerance=5, label="lines"):
+    if not lines:
+        print(f"[Grid] No {label} candidates to filter.")
+        return []
+    original_len = len(lines)
+    lines = _merge_nearby_positions(sorted(lines), gap=max(LINE_MERGE_GAP, tolerance))
+    if len(lines) != original_len:
+        print(f"[Grid] {label.title()} merged near-dupes: {original_len} -> {len(lines)}")
+    if len(lines) < 2:
+        print(f"[Grid] Not enough {label} candidates after merge: {lines}")
+        return lines
+    raw_spacings = [lines[i + 1] - lines[i] for i in range(len(lines) - 1)]
+    spacing_counts = {}
+    for s in raw_spacings:
+        if s <= max(LINE_MERGE_GAP, tolerance):
+            continue
+        b = round(s / tolerance) * tolerance
+        spacing_counts[b] = spacing_counts.get(b, 0) + 1
+    print(f"[Grid] {label.title()} spacing histogram (post-merge): {spacing_counts or {'<empty>': 0}}")
+    expected_spacing = _choose_expected_spacing(raw_spacings, tolerance, MIN_EXPECTED_SPACING)
+    if not expected_spacing:
+        print(f"[Grid] {label.title()} could not pick expected spacing, keeping merged lines.")
+        return lines
+    print(f"[Grid] {label.title()} spacing stats -> "
+          f"min: {min(raw_spacings)}, max: {max(raw_spacings)}, "
+          f"expected: {expected_spacing} (+/- {tolerance})")
+    best_seq = None
+    for start_idx in range(min(5, len(lines))):
+        seq = [lines[start_idx]]
+        last = lines[start_idx]
+        for p in lines[start_idx + 1:]:
+            delta = p - last
+            k = int(round(delta / float(expected_spacing))) if expected_spacing > 0 else 0
+            if k < 1 or k > MAX_JUMP_MULTIPLIER:
+                continue
+            if abs(delta - k * expected_spacing) <= tolerance * k:
+                seq.append(p)
+                last = p
+        if best_seq is None or len(seq) > len(best_seq):
+            best_seq = seq
+    if best_seq is None:
+        best_seq = lines
+    if len(best_seq) != len(lines):
+        print(f"[Grid] {label.title()} lines filtered from {len(lines)} to {len(best_seq)} using expected spacing {expected_spacing}.")
+    return best_seq
 
 def detect_grid(img):
     debug = img.copy()
+    print(f"[Grid] detect_grid start | image shape={img.shape}")
     mask_div = cv2.inRange(img, (20, 20, 20), (20, 20, 20))
+    mask_nonzero = int(np.count_nonzero(mask_div))
+    mask_ratio = mask_nonzero / mask_div.size if mask_div.size else 0.0
+    print(f"[Grid] Divider mask non-zero: {mask_nonzero}/{mask_div.size} ({mask_ratio:.2%})")
+    def _summarize(values, limit=10):
+        if not values:
+            return "[]"
+        preview = ", ".join(str(v) for v in values[:limit])
+        if len(values) > limit:
+            preview += ", ..."
+        return f"[{preview}]"
     horizontal_sum = np.sum(mask_div, axis=1)
-    horizontal_lines = [i for i, v in enumerate(horizontal_sum) if v > 0.9 * mask_div.shape[1] * 255]
-    horizontal_lines = filter_lines(horizontal_lines, tolerance=5)
+    row_threshold = 0.9 * mask_div.shape[1] * 255
+    print(f"[Grid] Horizontal sum stats -> min: {int(horizontal_sum.min())}, max: {int(horizontal_sum.max())}, threshold: {row_threshold:.0f}")
+    horizontal_candidates = [i for i, v in enumerate(horizontal_sum) if v > row_threshold]
+    print(f"[Grid] Horizontal candidates ({len(horizontal_candidates)}): {_summarize(horizontal_candidates)}")
+    horizontal_lines = filter_lines(horizontal_candidates, tolerance=5, label="horizontal")
+    print(f"[Grid] Horizontal lines filtered ({len(horizontal_lines)}): {_summarize(horizontal_lines)}")
     vertical_sum = np.sum(mask_div, axis=0)
-    vertical_lines = [i for i, v in enumerate(vertical_sum) if v > 0.9 * mask_div.shape[0] * 255]
-    vertical_lines = filter_lines(vertical_lines, tolerance=5)
+    col_threshold = 0.9 * mask_div.shape[0] * 255
+    print(f"[Grid] Vertical sum stats -> min: {int(vertical_sum.min())}, max: {int(vertical_sum.max())}, threshold: {col_threshold:.0f}")
+    vertical_candidates = [i for i, v in enumerate(vertical_sum) if v > col_threshold]
+    print(f"[Grid] Vertical candidates ({len(vertical_candidates)}): {_summarize(vertical_candidates)}")
+    vertical_lines = filter_lines(vertical_candidates, tolerance=5, label="vertical")
+    print(f"[Grid] Vertical lines filtered ({len(vertical_lines)}): {_summarize(vertical_lines)}")
+    if len(horizontal_lines) >= 2:
+        horizontal_spacing = [horizontal_lines[i + 1] - horizontal_lines[i] for i in range(len(horizontal_lines) - 1)]
+        print(f"[Grid] Horizontal spacing samples: {_summarize(horizontal_spacing)}")
+    else:
+        print("[Grid] Not enough horizontal lines to compute spacing.")
+
+    if len(vertical_lines) >= 2:
+        vertical_spacing = [vertical_lines[i + 1] - vertical_lines[i] for i in range(len(vertical_lines) - 1)]
+        print(f"[Grid] Vertical spacing samples: {_summarize(vertical_spacing)}")
+    else:
+        print("[Grid] Not enough vertical lines to compute spacing.")
     rows = len(horizontal_lines) - 1
     cols = len(vertical_lines) - 1
-    print(f"Detected grid: {rows}x{cols}")
+    print(f"[Grid] Detected grid dimensions: {rows} rows x {cols} cols")
+    if rows <= 0:
+        print("[Grid] Warning: insufficient horizontal lines to form rows.")
+    if cols <= 0:
+        print("[Grid] Warning: insufficient vertical lines to form columns.")
     for r in horizontal_lines:
         cv2.line(debug, (0, r), (img.shape[1], r), (0, 255, 0), 1)
     for c in vertical_lines:
@@ -299,7 +399,6 @@ def detect_grid(img):
 def detect_points(img, rows, cols, h_lines, v_lines, debug):
     detected = []
     color_clusters = []
-
     def assign_label(mean_color):
         for cluster in color_clusters:
             if np.linalg.norm(mean_color - cluster['mean']) < COLOR_DISTANCE_THRESHOLD:
@@ -314,7 +413,6 @@ def detect_points(img, rows, cols, h_lines, v_lines, debug):
             'count': 1,
         })
         return label
-
     for i in range(rows):
         for j in range(cols):
             x1, x2 = v_lines[j], v_lines[j + 1]
@@ -362,7 +460,7 @@ def solve_paths(rows, cols, detected):
         grid[r][c] = color
     if not endpoints:
         return None
-
+    
     def neighbors(cell):
         r, c = cell
         for dr, dc in ((1, 0), (-1, 0), (0, 1), (0, -1)):
@@ -481,6 +579,9 @@ def solve_paths(rows, cols, detected):
                 if val is None:
                     flat.append('0')
                 else:
+                    if val not in color_ids:
+                        color_ids[val] = len(color_ids)
+                        print(f"[Solver] Added new flow mapping: {val} -> {color_ids[val]}")
                     flat.append(str(color_ids[val] + 1))
         heads = []
         for color in active_colors:
