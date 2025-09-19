@@ -8,20 +8,12 @@ from collections import deque
 from threading import Event
 import interception
 import time, random
-
 interception.auto_capture_devices(keyboard=True, mouse=True)
-
 KILL_SWITCH_KEY = "delete"
-
 class KillSwitchActivated(Exception):
-    """Raised when the kill switch is engaged."""
     pass
-
-
 kill_switch_event = Event()
 _kill_switch_handle = None
-
-
 def engage_kill_switch():
     if kill_switch_event.is_set():
         return
@@ -33,16 +25,13 @@ def engage_kill_switch():
         pass
     print(f"Kill switch '{KILL_SWITCH_KEY}' engaged. Stopping mouse input.")
 
-
 def reset_kill_switch():
     if kill_switch_event.is_set():
         kill_switch_event.clear()
 
-
 def abort_if_killed():
     if kill_switch_event.is_set():
         raise KillSwitchActivated
-
 
 def _register_kill_switch_hotkey():
     global _kill_switch_handle
@@ -62,7 +51,6 @@ def _register_kill_switch_hotkey():
         _kill_switch_handle = None
         print(f"Failed to register kill switch hotkey '{KILL_SWITCH_KEY}': {exc}")
 
-
 def set_kill_switch_key(hotkey):
     global KILL_SWITCH_KEY
     normalized = hotkey.strip().lower()
@@ -71,17 +59,13 @@ def set_kill_switch_key(hotkey):
     KILL_SWITCH_KEY = normalized
     _register_kill_switch_hotkey()
 
-
 def get_kill_switch_key():
     return KILL_SWITCH_KEY
 
-
 _register_kill_switch_hotkey()
-
 SPEED = 1.25
 JITTER_SCALE = 1.2
 SMOOTHNESS = 0.8
-
 def set_speed(value):
     global SPEED
     try:
@@ -155,16 +139,12 @@ SEARCH_REGION = {
     "width": 1100,
     "height": 800
 }
-
-
-# Tunables for dynamic color detection
-COLOR_DISTANCE_THRESHOLD = 45
-SATURATION_THRESHOLD = 60
+COLOR_DISTANCE_THRESHOLD = 5
+SATURATION_THRESHOLD = 8
 VALUE_THRESHOLD = 50
-BRIGHT_VALUE_THRESHOLD = 200
-MIN_POINT_PIXELS = 20
-CORE_CROP_RATIO = 0.25
-
+BRIGHT_VALUE_THRESHOLD = 50
+MIN_POINT_PIXELS = 50
+CORE_CROP_RATIO = 0.15
 SW_RESTORE = 9
 user32 = ctypes.windll.user32
 kernel32 = ctypes.windll.kernel32
@@ -177,7 +157,6 @@ SetForegroundWindow = user32.SetForegroundWindow
 ShowWindow = user32.ShowWindow
 BringWindowToTop = user32.BringWindowToTop
 EnumWindowsProc = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_int, ctypes.c_int)
-
 def _enum_windows():
     results = []
     @EnumWindowsProc
@@ -260,8 +239,7 @@ def smooth_move_to(target, duration=0.2, jitter=False):
     abort_if_killed()
     interception.move_to(int(target[0]), int(target[1]))
 
-TOLERANCE = 5
-
+TOLERANCE = 0
 def color_match(pixel, target, tol=TOLERANCE):
     return all(abs(int(pixel[i]) - target[i]) <= tol for i in range(3))
 
@@ -384,7 +362,7 @@ def solve_paths(rows, cols, detected):
         grid[r][c] = color
     if not endpoints:
         return None
-    
+
     def neighbors(cell):
         r, c = cell
         for dr, dc in ((1, 0), (-1, 0), (0, 1), (0, -1)):
@@ -398,6 +376,7 @@ def solve_paths(rows, cols, detected):
             if nb == partner or grid[nb[0]][nb[1]] is None:
                 count += 1
         return count
+
     color_pairs = {}
     active_colors = []
     for color, pts in endpoints.items():
@@ -409,18 +388,41 @@ def solve_paths(rows, cols, detected):
             pts = sorted(pts)[:2]
         a, b = pts
         if free_neighbor_count(a, b) <= free_neighbor_count(b, a):
-            start, end = a, b
+            start_cell, end_cell = a, b
         else:
-            start, end = b, a
-        color_pairs[color] = (start, end)
+            start_cell, end_cell = b, a
+        color_pairs[color] = (start_cell, end_cell)
         active_colors.append(color)
     if not active_colors:
         return None
-
     active_colors.sort(key=lambda c: (-manhattan(color_pairs[c][0], color_pairs[c][1]), c))
     progress = {color: [color_pairs[color][0]] for color in active_colors}
+    progress_sets = {color: {color_pairs[color][0]} for color in active_colors}
     completed = set()
     solution_paths = {}
+    color_ids = {color: idx for idx, color in enumerate(active_colors)}
+    visited_failures = set()
+    def move_degree(color, cell):
+        target = color_pairs[color][1]
+        degree = 0
+        for nb in neighbors(cell):
+            if grid[nb[0]][nb[1]] is None or nb == target:
+                degree += 1
+        return degree
+
+    def legal_moves(color):
+        current = progress[color][-1]
+        target = color_pairs[color][1]
+        moves = []
+        visited_cells = progress_sets[color]
+        for nb in neighbors(current):
+            if nb == target:
+                moves.append({'cell': nb, 'is_target': True, 'degree': move_degree(color, nb), 'distance': 0})
+            elif grid[nb[0]][nb[1]] is None and nb not in visited_cells:
+                moves.append({'cell': nb, 'is_target': False, 'degree': move_degree(color, nb), 'distance': manhattan(nb, target)})
+        moves.sort(key=lambda info: (0 if info['is_target'] else 1, info['degree'], info['distance']))
+        return moves
+
     def path_possible(color):
         current = progress[color][-1]
         target = color_pairs[color][1]
@@ -438,60 +440,168 @@ def solve_paths(rows, cols, detected):
                     queue.append(nb)
         return False
 
+    def ensure_connectivity(specified_colors=None):
+        if specified_colors is None:
+            colors_to_check = [c for c in active_colors if c not in completed]
+        else:
+            colors_to_check = [c for c in specified_colors if c not in completed]
+        for color in colors_to_check:
+            if not path_possible(color):
+                return False
+        return True
+
+    def has_dead_cells():
+        incomplete = [c for c in active_colors if c not in completed]
+        if not incomplete:
+            return False
+        head_lookup = {progress[c][-1]: c for c in incomplete}
+        remaining_targets = {color_pairs[c][1]: c for c in incomplete}
+        for r in range(rows):
+            for c in range(cols):
+                if grid[r][c] is not None:
+                    continue
+                cell = (r, c)
+                accessible = 0
+                for nb in neighbors(cell):
+                    if grid[nb[0]][nb[1]] is None:
+                        accessible += 1
+                    elif nb in remaining_targets:
+                        accessible += 1
+                    elif nb in head_lookup:
+                        accessible += 1
+                if accessible <= 1:
+                    return True
+        return False
+
+    def state_signature():
+        flat = []
+        for r in range(rows):
+            for c in range(cols):
+                val = grid[r][c]
+                if val is None:
+                    flat.append('0')
+                else:
+                    flat.append(str(color_ids[val] + 1))
+        heads = []
+        for color in active_colors:
+            head = progress[color][-1]
+            heads.append(f"{head[0]}:{head[1]}")
+        completed_bits = ''.join('1' if color in completed else '0' for color in active_colors)
+        return ''.join(flat) + '|' + ';'.join(heads) + '|' + completed_bits
+
+    def make_move(color, cell):
+        progress[color].append(cell)
+        progress_sets[color].add(cell)
+        target = color_pairs[color][1]
+        if cell == target:
+            completed.add(color)
+            return ('complete', cell)
+        grid[cell[0]][cell[1]] = color
+        return ('fill', cell)
+
+    def undo_move(color, marker):
+        kind, cell = marker
+        if kind == 'fill':
+            grid[cell[0]][cell[1]] = None
+        else:
+            completed.discard(color)
+        progress_sets[color].discard(cell)
+        progress[color].pop()
+
+    def undo_history(history):
+        for color, marker in reversed(history):
+            undo_move(color, marker)
+        history.clear()
+
+    def apply_forced_moves(history):
+        while True:
+            changed = False
+            for color in active_colors:
+                if color in completed:
+                    continue
+                moves = legal_moves(color)
+                if not moves:
+                    return False
+                if len(moves) == 1:
+                    cell_info = moves[0]
+                    marker = make_move(color, cell_info['cell'])
+                    history.append((color, marker))
+                    if has_dead_cells() or not ensure_connectivity():
+                        return False
+                    changed = True
+                    break
+            if not changed:
+                return True
+
     def choose_color():
-        chosen = None
-        chosen_moves = None
+        best_color = None
+        best_moves = None
+        best_key = None
         for color in active_colors:
             if color in completed:
                 continue
-            current = progress[color][-1]
-            target = color_pairs[color][1]
-            moves = []
-            for nb in neighbors(current):
-                if nb == target:
-                    moves.append(nb)
-                elif grid[nb[0]][nb[1]] is None and nb not in progress[color]:
-                    moves.append(nb)
+            moves = legal_moves(color)
             if not moves:
                 return color, []
-            moves.sort(key=lambda nb: manhattan(nb, target))
-            if chosen is None or len(moves) < len(chosen_moves):
-                chosen = color
-                chosen_moves = moves
-        return chosen, chosen_moves
+            key = (len(moves), moves[0]['degree'], moves[0]['distance'], manhattan(progress[color][-1], color_pairs[color][1]))
+            if best_key is None or key < best_key:
+                best_color = color
+                best_moves = moves
+                best_key = key
+        return best_color, best_moves
 
     def search():
         if len(completed) == len(active_colors):
             for color in active_colors:
                 solution_paths[color] = list(progress[color])
             return True
+        state_key_before = state_signature()
+        if state_key_before in visited_failures:
+            return False
+        forced_history = []
+        if not apply_forced_moves(forced_history):
+            undo_history(forced_history)
+            visited_failures.add(state_key_before)
+            return False
+        if len(completed) == len(active_colors):
+            for color in active_colors:
+                solution_paths[color] = list(progress[color])
+            return True
+        state_key_after = state_signature()
+        if state_key_after in visited_failures:
+            undo_history(forced_history)
+            return False
+        if has_dead_cells() or not ensure_connectivity():
+            visited_failures.add(state_key_after)
+            undo_history(forced_history)
+            return False
         color, moves = choose_color()
         if color is None or not moves:
+            visited_failures.add(state_key_after)
+            undo_history(forced_history)
             return False
-        target = color_pairs[color][1]
-        for move in moves:
-            progress[color].append(move)
-            reached_goal = move == target
-            if not reached_goal:
-                grid[move[0]][move[1]] = color
+        for move_info in moves:
+            cell = move_info['cell']
+            marker = make_move(color, cell)
+            branch_history = []
+            ok = True
+            if has_dead_cells() or not ensure_connectivity():
+                ok = False
             else:
-                completed.add(color)
-            constraints_ok = True
-            if reached_goal:
-                pending = [c for c in active_colors if c not in completed]
-            else:
-                pending = [color] + [c for c in active_colors if c not in completed and c != color]
-            for pending_color in pending:
-                if not path_possible(pending_color):
-                    constraints_ok = False
-                    break
-            if constraints_ok and search():
+                if not apply_forced_moves(branch_history):
+                    ok = False
+                elif has_dead_cells() or not ensure_connectivity():
+                    ok = False
+            if ok:
+                branch_key = state_signature()
+                if branch_key in visited_failures:
+                    ok = False
+            if ok and search():
                 return True
-            if reached_goal:
-                completed.discard(color)
-            else:
-                grid[move[0]][move[1]] = None
-            progress[color].pop()
+            undo_history(branch_history)
+            undo_move(color, marker)
+        visited_failures.add(state_key_after)
+        undo_history(forced_history)
         return False
     success = search()
     if success:
@@ -530,6 +640,81 @@ def solve_paths_flexible(rows, cols, detected):
             relaxed_solution[color] = found_path
     return relaxed_solution if relaxed_solution else None
 
+def optimize_solution_paths(solutions, rows, cols, detected):
+    if not solutions:
+        return solutions, False
+    endpoints = {}
+    for r, c, color in detected:
+        endpoints.setdefault(color, []).append((r, c))
+    usable = {}
+    for color, pts in endpoints.items():
+        if len(pts) >= 2:
+            usable[color] = (pts[0], pts[1])
+    if not usable:
+        return solutions, False
+    optimized = {color: list(path) for color, path in solutions.items()}
+    rows = int(rows)
+    cols = int(cols)
+    grid = [[None for _ in range(cols)] for _ in range(rows)]
+    for color, path in optimized.items():
+        for r, c in path:
+            grid[r][c] = color
+    def shortest_path(start, end):
+        queue = deque([start])
+        parents = {start: None}
+        while queue:
+            cell = queue.popleft()
+            if cell == end:
+                break
+            r, c = cell
+            for dr, dc in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                nr, nc = r + dr, c + dc
+                if not (0 <= nr < rows and 0 <= nc < cols):
+                    continue
+                nxt = (nr, nc)
+                if nxt in parents:
+                    continue
+                occupant = grid[nr][nc]
+                if occupant is None or nxt == end:
+                    parents[nxt] = cell
+                    queue.append(nxt)
+        if end not in parents:
+            return None
+        path = []
+        cur = end
+        while cur is not None:
+            path.append(cur)
+            cur = parents[cur]
+        path.reverse()
+        return path
+    improved = False
+    while True:
+        changed = False
+        for color, endpoints_pair in usable.items():
+            path = optimized.get(color)
+            if not path or len(path) < 2:
+                continue
+            start, end = endpoints_pair
+            old_path = list(path)
+            old_length = len(old_path)
+            for r, c in old_path[1:-1]:
+                grid[r][c] = None
+            new_path = shortest_path(start, end)
+            if new_path and len(new_path) < old_length:
+                optimized[color] = new_path
+                for r, c in new_path:
+                    grid[r][c] = color
+                improved = True
+                changed = True
+            else:
+                for r, c in old_path[1:-1]:
+                    grid[r][c] = color
+        if not changed:
+            break
+    if not improved:
+        return solutions, False
+    return optimized, True
+
 def draw_paths(debug_img, paths, h_lines, v_lines, color_map):
     if not paths:
         return
@@ -548,7 +733,6 @@ def draw_paths(debug_img, paths, h_lines, v_lines, color_map):
             cv2.line(debug_img, centers[i], centers[i + 1], color_bgr, 5)
             cv2.circle(debug_img, centers[i], 6, color_bgr, -1)
         cv2.circle(debug_img, centers[-1], 6, color_bgr, -1)
-
 class PathProgressVisualizer:
     def __init__(self, base_image, h_lines, v_lines, color_map, alpha=0.45):
         try:
@@ -613,7 +797,6 @@ class PathProgressVisualizer:
             cv2.rectangle(canvas, (8, 8), (8 + text_box_width, 40), (0, 0, 0), -1)
             cv2.putText(canvas, label, (12, 32), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1, cv2.LINE_AA)
         return canvas
-
 
 def cell_center(row, col, h_lines, v_lines, origin_x, origin_y):
     x1 = origin_x + v_lines[col]
@@ -707,7 +890,6 @@ def drag_path(color, cells, centers, hold=True, progress_callback=None, progress
         mouse_down()
         scaled_sleep(0.005)
     total_steps = len(cells) if cells else 0
-
     def send_progress(step_index):
         if (
             progress_callback is None
@@ -752,7 +934,6 @@ def drag_path(color, cells, centers, hold=True, progress_callback=None, progress
         abort_if_killed()
         mouse_up()
 
-
 def execute_single_path(color, cells, h_lines, v_lines, origin_x, origin_y, progress_callback=None, progress_visualizer=None):
     if len(cells) < 2:
         print("Path too short, skipping.")
@@ -767,7 +948,6 @@ def execute_single_path(color, cells, h_lines, v_lines, origin_x, origin_y, prog
         progress_callback=progress_callback,
         progress_visualizer=progress_visualizer,
     )
-
 
 def execute_all_paths(solutions, h_lines, v_lines, origin_x, origin_y, progress_callback=None, progress_visualizer=None):
     abort_if_killed()
@@ -793,7 +973,6 @@ def execute_all_paths(solutions, h_lines, v_lines, origin_x, origin_y, progress_
         )
         del remaining[color]
 
-
 def run_one_puzzle(return_debug=False, progress_callback=None):
     def _result(success, debug_image=None):
         if return_debug:
@@ -807,9 +986,7 @@ def run_one_puzzle(return_debug=False, progress_callback=None):
             progress_callback(stage, image)
         except Exception:
             pass
-
     debug_image = None
-
     try:
         screenshot = capture_region()
         bbox = find_puzzle_bbox(screenshot)
@@ -841,6 +1018,12 @@ def run_one_puzzle(return_debug=False, progress_callback=None):
         print(f"Total unique paths needed: {len(color_map)}")
         solutions = solve_paths_flexible(rows, cols, detected)
         if solutions:
+            total_cells_before = sum(len(path) for path in solutions.values())
+            optimized_solutions, optimized = optimize_solution_paths(solutions, rows, cols, detected)
+            solutions = optimized_solutions
+            if optimized:
+                total_cells_after = sum(len(path) for path in solutions.values())
+                print(f"Optimized total path length: {total_cells_before} -> {total_cells_after}")
             preview = debug.copy()
             draw_paths(preview, solutions, h_lines, v_lines, color_map)
             debug_image = preview.copy()
@@ -863,7 +1046,6 @@ def run_one_puzzle(return_debug=False, progress_callback=None):
             _emit("no_solution", debug.copy())
         print("Puzzle Complete/Canceled!")
         return _result(True, debug_image)
-
     except KillSwitchActivated:
         print("Kill switch engaged. Canceling current puzzle.")
         _emit("killed", None)
@@ -919,18 +1101,3 @@ def main():
             break
 if __name__ == "__main__":
     main()
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-

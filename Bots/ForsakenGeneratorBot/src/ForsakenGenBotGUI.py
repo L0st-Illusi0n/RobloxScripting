@@ -5,16 +5,11 @@ import contextlib
 import traceback
 import time
 from typing import Optional, Tuple, Dict
-
 import tkinter as tk
 from tkinter import ttk, scrolledtext, messagebox
-
 import keyboard
 from PIL import Image, ImageTk, ImageOps
-
 import ForsakenGenBot as bot
-
-
 STATUS_STYLES = {
     "ready": {"bg": "#142d26", "fg": "#5af2bb"},
     "running": {"bg": "#132649", "fg": "#6fb4ff"},
@@ -22,15 +17,12 @@ STATUS_STYLES = {
     "warning": {"bg": "#2f260f", "fg": "#f8d16b"},
     "error": {"bg": "#311a1f", "fg": "#ff8a8a"},
 }
-
 DEFAULT_HOTKEYS = {
     "single": "page down",
     "continuous": "page up",
     "stop": "end",
     "kill": bot.get_kill_switch_key(),
 }
-
-
 class QueueWriter:
     def __init__(self, output_queue: queue.Queue):
         self.queue = output_queue
@@ -57,23 +49,18 @@ class ForsakenBotGUI:
         self.preview_max_size = (720, 520)
         self.root.geometry("960x640")
         self.root.minsize(820, 560)
-
         self._init_styles()
-
         self.log_queue: queue.Queue = queue.Queue()
         self.worker_thread: Optional[threading.Thread] = None
         self.stop_event = threading.Event()
         self.pending_close = False
         self.running_mode: Optional[str] = None
         self.status_state = "ready"
-
         settings = bot.get_settings()
-
         self.status_var = tk.StringVar(value="Ready")
         self.speed_var = tk.DoubleVar(value=settings["speed"])
         self.jitter_var = tk.DoubleVar(value=settings["jitter_scale"])
         self.smoothness_var = tk.DoubleVar(value=settings["smoothness"])
-
         self.hotkeys: Dict[str, str] = dict(DEFAULT_HOTKEYS)
         self.hotkey_vars: Dict[str, tk.StringVar] = {
             action: tk.StringVar(value=hotkey)
@@ -84,20 +71,17 @@ class ForsakenBotGUI:
         self._pending_hotkey_action: Optional[str] = None
         self._capture_hook = None
         self._capture_previous: Optional[Dict[str, str]] = None
-
         self.preview_placeholder = "Waiting for puzzle..."
         self.current_puzzle_photo: Optional[ImageTk.PhotoImage] = None
         self.preview_status_var = tk.StringVar(value=self.preview_placeholder)
         self.preview_source_image: Optional[Image.Image] = None
         self.preview_last_message = self.preview_placeholder
         self.preview_last_size: Tuple[int, int] = (0, 0)
-
         self._build_ui()
         self._apply_status("Ready", "ready")
         self._set_puzzle_preview(None, self.preview_placeholder)
         self.process_log_queue()
         self._register_hotkeys()
-
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
 
     def _init_styles(self) -> None:
@@ -106,7 +90,6 @@ class ForsakenBotGUI:
             self.style.theme_use("clam")
         except tk.TclError:
             pass
-
         self.colors = {
             "background": "#0f111a",
             "panel": "#171c2b",
@@ -127,7 +110,6 @@ class ForsakenBotGUI:
             "danger_active": "#dc5a5a",
         }
         self.root.configure(bg=self.colors["background"])
-
         self.style.configure("Root.TFrame", background=self.colors["background"])
         self.style.configure("Panel.TFrame", background=self.colors["panel"])
         self.style.configure(
@@ -297,11 +279,9 @@ class ForsakenBotGUI:
         container.columnconfigure(0, weight=1)
         container.columnconfigure(1, weight=1)
         container.rowconfigure(2, weight=1)
-
         status_frame = ttk.Frame(container, style="Root.TFrame")
         status_frame.grid(row=0, column=0, columnspan=2, sticky="ew")
         status_frame.columnconfigure(1, weight=1)
-
         ttk.Label(status_frame, text="Status:", style="Heading.TLabel").grid(row=0, column=0, sticky="w")
         self.status_label = tk.Label(
             status_frame,
@@ -315,11 +295,9 @@ class ForsakenBotGUI:
         )
         self.status_label.grid(row=0, column=1, sticky="w", padx=(8, 0))
         self.status_label.configure(bg=STATUS_STYLES["ready"]["bg"], fg=STATUS_STYLES["ready"]["fg"])
-
         buttons_frame = ttk.Frame(container, style="Root.TFrame")
         buttons_frame.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(10, 6))
         buttons_frame.columnconfigure((0, 1, 2, 3), weight=1)
-
         self.single_button = ttk.Button(
             buttons_frame,
             text="Run Single Puzzle",
@@ -327,7 +305,6 @@ class ForsakenBotGUI:
             style="Primary.TButton",
         )
         self.single_button.grid(row=0, column=0, padx=5, sticky="ew")
-
         self.continuous_button = ttk.Button(
             buttons_frame,
             text="Run Continuous",
@@ -335,7 +312,6 @@ class ForsakenBotGUI:
             style="Primary.TButton",
         )
         self.continuous_button.grid(row=0, column=1, padx=5, sticky="ew")
-
         self.stop_button = ttk.Button(
             buttons_frame,
             text="Stop",
@@ -344,7 +320,6 @@ class ForsakenBotGUI:
             style="Danger.TButton",
         )
         self.stop_button.grid(row=0, column=2, padx=5, sticky="ew")
-
         self.clear_log_button = ttk.Button(
             buttons_frame,
             text="Clear Log",
@@ -352,25 +327,21 @@ class ForsakenBotGUI:
             style="Secondary.TButton",
         )
         self.clear_log_button.grid(row=0, column=3, padx=5, sticky="ew")
-
         main_area = ttk.Frame(container, style="Root.TFrame")
         main_area.grid(row=2, column=0, columnspan=2, sticky="nsew", pady=(6, 0))
         main_area.columnconfigure(0, weight=5)
         main_area.columnconfigure(1, weight=2)
         main_area.rowconfigure(0, weight=1)
-
         left_column = ttk.Frame(main_area, style="Root.TFrame")
         left_column.grid(row=0, column=0, sticky="nsew", padx=(0, 10))
         left_column.columnconfigure(0, weight=1)
         left_column.rowconfigure(0, weight=6)
         left_column.rowconfigure(1, weight=2)
-
         preview_frame = ttk.LabelFrame(left_column, text="Current Puzzle", padding=(10, 10), style="Panel.TLabelframe")
         preview_frame.grid(row=0, column=0, sticky="nsew")
         preview_frame.columnconfigure(0, weight=1)
         preview_frame.rowconfigure(0, weight=0)
         preview_frame.rowconfigure(1, weight=1)
-
         status_label = ttk.Label(
             preview_frame,
             textvariable=self.preview_status_var,
@@ -379,13 +350,11 @@ class ForsakenBotGUI:
             style="PreviewStatus.TLabel",
         )
         status_label.grid(row=0, column=0, sticky="ew")
-
         image_container = ttk.Frame(preview_frame, style="Preview.TFrame")
         image_container.grid(row=1, column=0, sticky="nsew", padx=8, pady=(4, 10))
         image_container.columnconfigure(0, weight=1)
         image_container.rowconfigure(0, weight=1)
         image_container.bind("<Configure>", self._on_preview_resize)
-
         self.puzzle_label = tk.Label(
             image_container,
             text="",
@@ -399,12 +368,10 @@ class ForsakenBotGUI:
             bd=0,
         )
         self.puzzle_label.grid(row=0, column=0, sticky="nsew")
-
         log_frame = ttk.LabelFrame(left_column, text="Debug Output", padding=10, style="Log.TLabelframe")
         log_frame.grid(row=1, column=0, sticky="nsew", pady=(12, 0))
         log_frame.rowconfigure(0, weight=1)
         log_frame.columnconfigure(0, weight=1)
-
         self.log_text = scrolledtext.ScrolledText(
             log_frame,
             wrap=tk.WORD,
@@ -424,12 +391,10 @@ class ForsakenBotGUI:
             inactiveselectbackground=self.colors["accent"],
             selectforeground=self.colors["background"],
         )
-
         settings_frame = ttk.LabelFrame(main_area, text="Settings", padding=(12, 10), style="Panel.TLabelframe")
         settings_frame.grid(row=0, column=1, sticky="nsew")
         settings_frame.columnconfigure(0, weight=1)
         settings_frame.columnconfigure(1, weight=0)
-
         ttk.Label(settings_frame, text="Speed Multiplier", style="PanelInfo.TLabel").grid(row=0, column=0, sticky="w", pady=(4, 0))
         speed_scale = ttk.Scale(
             settings_frame,
@@ -442,7 +407,6 @@ class ForsakenBotGUI:
         speed_scale.grid(row=1, column=0, sticky="ew")
         self.speed_value = ttk.Label(settings_frame, text=f"{self.speed_var.get():.2f}x", style="PanelValue.TLabel")
         self.speed_value.grid(row=1, column=1, padx=(6, 0))
-
         ttk.Label(settings_frame, text="Jitteriness", style="PanelInfo.TLabel").grid(row=2, column=0, sticky="w", pady=(12, 0))
         jitter_scale = ttk.Scale(
             settings_frame,
@@ -455,7 +419,6 @@ class ForsakenBotGUI:
         jitter_scale.grid(row=3, column=0, sticky="ew")
         self.jitter_value = ttk.Label(settings_frame, text=f"{self.jitter_var.get():.2f}", style="PanelValue.TLabel")
         self.jitter_value.grid(row=3, column=1, padx=(6, 0))
-
         ttk.Label(settings_frame, text="Smoothness", style="PanelInfo.TLabel").grid(row=4, column=0, sticky="w", pady=(12, 0))
         smooth_scale = ttk.Scale(
             settings_frame,
@@ -468,17 +431,14 @@ class ForsakenBotGUI:
         smooth_scale.grid(row=5, column=0, sticky="ew")
         self.smooth_value = ttk.Label(settings_frame, text=f"{self.smoothness_var.get():.2f}", style="PanelValue.TLabel")
         self.smooth_value.grid(row=5, column=1, padx=(6, 0))
-
         ttk.Separator(settings_frame, orient="horizontal", style="Settings.TSeparator").grid(row=6, column=0, columnspan=2, sticky="ew", pady=(18, 10))
         ttk.Label(settings_frame, text="Hotkeys", style="PanelHeading.TLabel").grid(row=7, column=0, columnspan=2, sticky="w")
-
         keybinds = [
             ("single", "Run Single Puzzle"),
             ("continuous", "Run Continuous"),
             ("stop", "Stop"),
             ("kill", "Kill Switch"),
         ]
-
         for offset, (action, label_text) in enumerate(keybinds):
             row_index = 8 + offset * 2
             ttk.Label(settings_frame, text=label_text, style="PanelInfo.TLabel").grid(row=row_index, column=0, sticky="w", pady=(6, 0))
@@ -496,11 +456,9 @@ class ForsakenBotGUI:
             )
             change_button.grid(row=0, column=1, padx=(8, 0))
             self.hotkey_buttons[action] = change_button
-
         settings_frame.rowconfigure(20, weight=1)
-
+        
     def process_log_queue(self) -> None:
-
         try:
             while True:
                 message = self.log_queue.get_nowait()
