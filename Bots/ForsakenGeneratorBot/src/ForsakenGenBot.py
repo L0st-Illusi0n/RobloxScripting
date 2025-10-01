@@ -12,8 +12,14 @@ interception.auto_capture_devices(keyboard=True, mouse=True)
 KILL_SWITCH_KEY = "delete"
 class KillSwitchActivated(Exception):
     pass
+
+class PuzzleNotAvailable(Exception):
+    pass
+
 kill_switch_event = Event()
 _kill_switch_handle = None
+_puzzle_monitor = None
+
 def engage_kill_switch():
     if kill_switch_event.is_set():
         return
@@ -29,9 +35,23 @@ def reset_kill_switch():
     if kill_switch_event.is_set():
         kill_switch_event.clear()
 
+def set_puzzle_monitor(monitor):
+    global _puzzle_monitor
+    _puzzle_monitor = monitor
+
+def clear_puzzle_monitor():
+    global _puzzle_monitor
+    _puzzle_monitor = None
+
+def get_puzzle_monitor():
+    return _puzzle_monitor
+
 def abort_if_killed():
     if kill_switch_event.is_set():
         raise KillSwitchActivated
+    monitor = _puzzle_monitor
+    if monitor is not None:
+        monitor.ensure_present()
 
 def _register_kill_switch_hotkey():
     global _kill_switch_handle
@@ -63,9 +83,9 @@ def get_kill_switch_key():
     return KILL_SWITCH_KEY
 
 _register_kill_switch_hotkey()
-SPEED = 1.25
-JITTER_SCALE = 1.2
-SMOOTHNESS = 0.8
+SPEED = 0.95
+JITTER_SCALE = 0.6
+SMOOTHNESS = 0.55
 def set_speed(value):
     global SPEED
     try:
@@ -257,6 +277,38 @@ def find_puzzle_bbox(img):
         return None
     largest = max(contours, key=cv2.contourArea)
     return cv2.boundingRect(largest)
+
+class PuzzlePresenceMonitor:
+    def __init__(self, bbox, tolerance=25, check_interval=0.3):
+        self.reference_bbox = tuple(int(v) for v in bbox) if bbox else None
+        self.tolerance = max(0, int(round(tolerance)))
+        self.check_interval = max(0.05, float(check_interval))
+        self._last_check = 0.0
+
+    def ensure_present(self):
+        if self.reference_bbox is None:
+            return
+        now = time.time()
+        if now - self._last_check < self.check_interval:
+            return
+        try:
+            screenshot = capture_region()
+        except Exception as exc:
+            raise PuzzleNotAvailable(f"Failed to capture puzzle region: {exc}") from exc
+        bbox = find_puzzle_bbox(screenshot)
+        if not bbox:
+            raise PuzzleNotAvailable("Puzzle area not found.")
+        rx, ry, rw, rh = self.reference_bbox
+        x, y, w, h = (int(bbox[0]), int(bbox[1]), int(bbox[2]), int(bbox[3]))
+        if (
+            abs(x - rx) > self.tolerance
+            or abs(y - ry) > self.tolerance
+            or abs(w - rw) > self.tolerance
+            or abs(h - rh) > self.tolerance
+        ):
+            raise PuzzleNotAvailable("Puzzle bounds changed unexpectedly.")
+        self.reference_bbox = (x, y, w, h)
+        self._last_check = now
 
 LINE_MERGE_GAP = 3
 MIN_EXPECTED_SPACING = 12 
@@ -986,54 +1038,74 @@ def drag_path(color, cells, centers, hold=True, progress_callback=None, progress
     abort_if_killed()
     smooth_move_to(centers[0], duration=0.15 * SPEED, jitter=False)
     scaled_sleep(0.01)
-    if hold:
-        abort_if_killed()
-        mouse_down()
-        scaled_sleep(0.005)
-    total_steps = len(cells) if cells else 0
-    def send_progress(step_index):
-        if (
-            progress_callback is None
-            or progress_visualizer is None
-            or not cells
-            or step_index <= 0
-            or step_index > total_steps
-        ):
-            return
-        cell = cells[step_index - 1]
-        progress_visualizer.mark_cell(cell, color)
-        label = f"{color}: {step_index}/{total_steps}"
-        frame = progress_visualizer.snapshot(current_cell=cell, current_color=color, label=label)
-        try:
-            progress_callback(f"path_progress|{color}|{step_index}|{total_steps}", frame)
-        except Exception:
-            pass
+    mouse_is_down = False
+    try:
+        if hold:
+            abort_if_killed()
+            mouse_down()
+            mouse_is_down = True
+            scaled_sleep(0.005)
+        total_steps = len(cells) if cells else 0
 
-    if total_steps:
-        send_progress(1)
-    for i in range(len(centers) - 1):
-        abort_if_killed()
-        segment = interpolate_segment(centers[i], centers[i+1], steps=10)
-        for j, (px, py) in enumerate(segment):
-            abort_if_killed()
-            interception.move_to(px, py)
-            scaled_sleep(0.0025 + random.uniform(-0.0005, 0.0005))
+        def send_progress(step_index):
+            if (
+                progress_callback is None
+                or progress_visualizer is None
+                or not cells
+                or step_index <= 0
+                or step_index > total_steps
+            ):
+                return
+            cell = cells[step_index - 1]
+            progress_visualizer.mark_cell(cell, color)
+            label = f"{color}: {step_index}/{total_steps}"
+            frame = progress_visualizer.snapshot(current_cell=cell, current_color=color, label=label)
+            try:
+                progress_callback(f"path_progress|{color}|{step_index}|{total_steps}", frame)
+            except Exception:
+                pass
+
         if total_steps:
-            send_progress(i + 2)
-        if i < len(centers) - 2:
+            send_progress(1)
+        for i in range(len(centers) - 1):
             abort_if_killed()
-            dx1 = centers[i+1][0] - centers[i][0]
-            dy1 = centers[i+1][1] - centers[i][1]
-            dx2 = centers[i+2][0] - centers[i+1][0]
-            dy2 = centers[i+2][1] - centers[i+1][1]
-            if (dx1, dy1) != (dx2, dy2):
-                scaled_sleep(random.uniform(0.02, 0.04))
-        if random.random() < 0.15:
-            scaled_sleep(random.uniform(0.01, 0.03))
-    if hold:
-        scaled_sleep(0.01)
-        abort_if_killed()
-        mouse_up()
+            segment = interpolate_segment(centers[i], centers[i + 1], steps=10)
+            for j, (px, py) in enumerate(segment):
+                abort_if_killed()
+                interception.move_to(px, py)
+                scaled_sleep(0.0025 + random.uniform(-0.0005, 0.0005))
+            if total_steps:
+                send_progress(i + 2)
+            if i < len(centers) - 2:
+                abort_if_killed()
+                dx1 = centers[i + 1][0] - centers[i][0]
+                dy1 = centers[i + 1][1] - centers[i][1]
+                dx2 = centers[i + 2][0] - centers[i + 1][0]
+                dy2 = centers[i + 2][1] - centers[i + 1][1]
+                if (dx1, dy1) != (dx2, dy2):
+                    scaled_sleep(random.uniform(0.02, 0.04))
+            if random.random() < 0.15:
+                scaled_sleep(random.uniform(0.01, 0.03))
+        if hold:
+            scaled_sleep(0.01)
+            abort_if_killed()
+    finally:
+        if hold and mouse_is_down:
+            try:
+                mouse_up()
+            except PuzzleNotAvailable:
+                try:
+                    interception.mouse_up(button="left")
+                except Exception:
+                    pass
+            except KillSwitchActivated:
+                try:
+                    interception.mouse_up(button="left")
+                except Exception:
+                    pass
+                raise
+            except Exception:
+                pass
 
 def execute_single_path(color, cells, h_lines, v_lines, origin_x, origin_y, progress_callback=None, progress_visualizer=None):
     if len(cells) < 2:
@@ -1088,14 +1160,20 @@ def run_one_puzzle(return_debug=False, progress_callback=None):
         except Exception:
             pass
     debug_image = None
+    monitor = None
     try:
-        screenshot = capture_region()
+        try:
+            screenshot = capture_region()
+        except Exception as exc:
+            raise PuzzleNotAvailable(f"Failed to capture puzzle region: {exc}") from exc
         bbox = find_puzzle_bbox(screenshot)
         if not bbox:
             print("Puzzle not found.")
             _emit("no_puzzle", None)
             return _result(False, None)
         x, y, w, h = bbox
+        monitor = PuzzlePresenceMonitor((x, y, w, h))
+        set_puzzle_monitor(monitor)
         puzzle = screenshot[y:y + h, x:x + w]
         _emit("puzzle_captured", puzzle.copy())
         origin_x = SEARCH_REGION["left"] + x
@@ -1147,13 +1225,23 @@ def run_one_puzzle(return_debug=False, progress_callback=None):
             _emit("no_solution", debug.copy())
         print("Puzzle Complete/Canceled!")
         return _result(True, debug_image)
+    except PuzzleNotAvailable as exc:
+        reason = str(exc).strip()
+        message = "Puzzle closed or canceled."
+        if reason:
+            message = f"{message} ({reason})"
+        print(message)
+        _emit("puzzle_missing", None)
+        return _result(False, debug_image)
     except KillSwitchActivated:
         print("Kill switch engaged. Canceling current puzzle.")
         _emit("killed", None)
         raise
+    finally:
+        clear_puzzle_monitor()
 
 def main():
-    print(f"Ready. Press PgDn for one puzzle, PgUp for continuous mode. Press end to quit. Press {KILL_SWITCH_KEY} to halt instantly.")
+    print(f"Ready. Press PgDn for one puzzle, PgUp for continuous mode. Press end to quit after current action. Press {KILL_SWITCH_KEY} to halt instantly.")
     while True:
         event = keyboard.read_event(suppress=False)
         if getattr(event, "event_type", None) != keyboard.KEY_DOWN:
