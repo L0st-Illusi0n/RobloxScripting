@@ -86,6 +86,7 @@ _register_kill_switch_hotkey()
 SPEED = 0.95
 JITTER_SCALE = 0.6
 SMOOTHNESS = 0.55
+AUTO_IDLE_DELAY = 0.5
 def set_speed(value):
     global SPEED
     try:
@@ -165,72 +166,6 @@ VALUE_THRESHOLD = 50
 BRIGHT_VALUE_THRESHOLD = 50
 MIN_POINT_PIXELS = 50
 CORE_CROP_RATIO = 0.15
-SW_RESTORE = 9
-user32 = ctypes.windll.user32
-kernel32 = ctypes.windll.kernel32
-EnumWindows = user32.EnumWindows
-IsWindowVisible = user32.IsWindowVisible
-GetWindowTextW = user32.GetWindowTextW
-GetWindowTextLengthW = user32.GetWindowTextLengthW
-GetForegroundWindow = user32.GetForegroundWindow
-SetForegroundWindow = user32.SetForegroundWindow
-ShowWindow = user32.ShowWindow
-BringWindowToTop = user32.BringWindowToTop
-EnumWindowsProc = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_int, ctypes.c_int)
-def _enum_windows():
-    results = []
-    @EnumWindowsProc
-    def _proc(hwnd, lParam):
-        try:
-            if IsWindowVisible(hwnd):
-                length = GetWindowTextLengthW(hwnd)
-                if length > 0:
-                    buff = ctypes.create_unicode_buffer(length + 1)
-                    GetWindowTextW(hwnd, buff, length + 1)
-                    title = buff.value
-                    results.append((hwnd, title))
-        except Exception:
-            pass
-        return True
-    EnumWindows(_proc, 0)
-    return results
-
-def find_window_by_substring(substring):
-    substring = substring.lower()
-    for hwnd, title in _enum_windows():
-        if substring in title.lower():
-            return hwnd, title
-    return None, None
-
-def focus_window_by_name(substring="Roblox", timeout=1.5, require_restore=True):
-    hwnd = find_window_by_substring(substring)
-    if not hwnd:
-        return False
-    try:
-        if require_restore:
-            ShowWindow(hwnd, SW_RESTORE)
-        BringWindowToTop(hwnd)
-        SetForegroundWindow(hwnd)
-    except Exception:
-        pass
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        if GetForegroundWindow() == hwnd:
-            return True
-        scaled_sleep(0.03)
-    try:
-        ShowWindow(hwnd, SW_RESTORE)
-        BringWindowToTop(hwnd)
-        SetForegroundWindow(hwnd)
-    except Exception:
-        pass
-    return GetForegroundWindow() == hwnd
-
-def ensure_focused_and_pause(window_substring="Roblox", timeout=1.5, pause_after=0.12):
-    ok = focus_window_by_name(window_substring, timeout=timeout)
-    if ok:
-        scaled_sleep(pause_after)
-    return ok
 
 def smoothstep(t):
     return t * t * (3 - 2 * t)
@@ -1146,7 +1081,7 @@ def execute_all_paths(solutions, h_lines, v_lines, origin_x, origin_y, progress_
         )
         del remaining[color]
 
-def run_one_puzzle(return_debug=False, progress_callback=None):
+def run_one_puzzle(return_debug=False, progress_callback=None, silent_no_puzzle=False):
     def _result(success, debug_image=None):
         if return_debug:
             return success, debug_image
@@ -1168,8 +1103,9 @@ def run_one_puzzle(return_debug=False, progress_callback=None):
             raise PuzzleNotAvailable(f"Failed to capture puzzle region: {exc}") from exc
         bbox = find_puzzle_bbox(screenshot)
         if not bbox:
-            print("Puzzle not found.")
-            _emit("no_puzzle", None)
+            if not silent_no_puzzle:
+                print("Puzzle not found.")
+                _emit("no_puzzle", None)
             return _result(False, None)
         x, y, w, h = bbox
         monitor = PuzzlePresenceMonitor((x, y, w, h))
@@ -1241,7 +1177,7 @@ def run_one_puzzle(return_debug=False, progress_callback=None):
         clear_puzzle_monitor()
 
 def main():
-    print(f"Ready. Press PgDn for one puzzle, PgUp for continuous mode. Press end to quit after current action. Press {KILL_SWITCH_KEY} to halt instantly.")
+    print(f"Ready. Press PgDn for one puzzle, PgUp for continuous mode, Home for auto-complete. Press end to quit after current action. Press {KILL_SWITCH_KEY} to halt instantly.")
     while True:
         event = keyboard.read_event(suppress=False)
         if getattr(event, "event_type", None) != keyboard.KEY_DOWN:
@@ -1265,7 +1201,7 @@ def main():
             while True:
                 try:
                     reset_kill_switch()
-                    success = run_one_puzzle()
+                    success = run_one_puzzle(silent_no_puzzle=True)
                 except KillSwitchActivated:
                     print("Kill switch engaged. Stopping continuous mode.")
                     reset_kill_switch()
@@ -1284,6 +1220,48 @@ def main():
                     reset_kill_switch()
                     print("end pressed, stopping continuous mode.")
                     return
+            reset_kill_switch()
+        elif key == "home":
+            print("Running auto-complete mode...")
+            puzzles_completed = 0
+            idle_message_printed = False
+            while True:
+                if keyboard.is_pressed("end"):
+                    reset_kill_switch()
+                    print("end pressed, stopping auto-complete mode.")
+                    break
+                try:
+                    reset_kill_switch()
+                    success = run_one_puzzle(silent_no_puzzle=True)
+                except KillSwitchActivated:
+                    print("Kill switch engaged. Stopping auto-complete mode.")
+                    reset_kill_switch()
+                    break
+                if success:
+                    puzzles_completed += 1
+                    idle_message_printed = False
+                    print(f"Auto-complete solved puzzle #{puzzles_completed}.")
+                    try:
+                        scaled_sleep(0.35)
+                    except KillSwitchActivated:
+                        print("Kill switch engaged. Stopping auto-complete mode.")
+                        reset_kill_switch()
+                        break
+                    if keyboard.is_pressed("end"):
+                        reset_kill_switch()
+                        print("end pressed, stopping auto-complete mode.")
+                        break
+                    continue
+                if not idle_message_printed:
+                    print("Waiting for puzzle to appear...")
+                    idle_message_printed = True
+                try:
+                    scaled_sleep(AUTO_IDLE_DELAY)
+                except KillSwitchActivated:
+                    print("Kill switch engaged. Stopping auto-complete mode.")
+                    reset_kill_switch()
+                    break
+            print("Auto-complete mode stopped.")
             reset_kill_switch()
         elif key == "end":
             print("Exiting script.")

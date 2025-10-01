@@ -20,6 +20,7 @@ STATUS_STYLES = {
 DEFAULT_HOTKEYS = {
     "single": "page down",
     "continuous": "page up",
+    "auto": "home",
     "stop": "end",
     "kill": bot.get_kill_switch_key(),
 }
@@ -77,6 +78,9 @@ class ForsakenBotGUI:
         self.preview_source_image: Optional[Image.Image] = None
         self.preview_last_message = self.preview_placeholder
         self.preview_last_size: Tuple[int, int] = (0, 0)
+        self._has_confirmed_puzzle = False
+        self._waiting_displayed = False
+        self._auto_solver_logging = False
         self._build_ui()
         self._apply_status("Ready", "ready")
         self._set_puzzle_preview(None, self.preview_placeholder)
@@ -297,7 +301,7 @@ class ForsakenBotGUI:
         self.status_label.configure(bg=STATUS_STYLES["ready"]["bg"], fg=STATUS_STYLES["ready"]["fg"])
         buttons_frame = ttk.Frame(container, style="Root.TFrame")
         buttons_frame.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(10, 6))
-        buttons_frame.columnconfigure((0, 1, 2, 3), weight=1)
+        buttons_frame.columnconfigure((0, 1, 2, 3, 4), weight=1)
         self.single_button = ttk.Button(
             buttons_frame,
             text="Run Single Puzzle",
@@ -312,6 +316,13 @@ class ForsakenBotGUI:
             style="Primary.TButton",
         )
         self.continuous_button.grid(row=0, column=1, padx=5, sticky="ew")
+        self.auto_button = ttk.Button(
+            buttons_frame,
+            text="Auto Complete",
+            command=self.start_auto,
+            style="Primary.TButton",
+        )
+        self.auto_button.grid(row=0, column=2, padx=5, sticky="ew")
         self.stop_button = ttk.Button(
             buttons_frame,
             text="Stop",
@@ -319,14 +330,14 @@ class ForsakenBotGUI:
             state="disabled",
             style="Danger.TButton",
         )
-        self.stop_button.grid(row=0, column=2, padx=5, sticky="ew")
+        self.stop_button.grid(row=0, column=3, padx=5, sticky="ew")
         self.clear_log_button = ttk.Button(
             buttons_frame,
             text="Clear Log",
             command=self.clear_log,
             style="Secondary.TButton",
         )
-        self.clear_log_button.grid(row=0, column=3, padx=5, sticky="ew")
+        self.clear_log_button.grid(row=0, column=4, padx=5, sticky="ew")
         main_area = ttk.Frame(container, style="Root.TFrame")
         main_area.grid(row=2, column=0, columnspan=2, sticky="nsew", pady=(6, 0))
         main_area.columnconfigure(0, weight=5)
@@ -436,6 +447,7 @@ class ForsakenBotGUI:
         keybinds = [
             ("single", "Run Single Puzzle"),
             ("continuous", "Run Continuous"),
+            ("auto", "Auto Complete"),
             ("stop", "Stop"),
             ("kill", "Kill Switch"),
         ]
@@ -468,6 +480,14 @@ class ForsakenBotGUI:
         self.root.after(80, self.process_log_queue)
 
     def _append_to_log(self, message: str) -> None:
+        if (
+            self.running_mode == "auto"
+            and not self._auto_solver_logging
+            and message.strip()
+            and not message.lstrip().startswith("[GUI]")
+            and not message.lstrip().lower().startswith("puzzle closed or canceled")
+        ):
+            return
         self.log_text.configure(state="normal")
         timestamp = time.strftime("[%H:%M:%S] ")
         if message.endswith("\n"):
@@ -489,6 +509,9 @@ class ForsakenBotGUI:
     def start_continuous(self) -> None:
         self._start_worker("continuous")
 
+    def start_auto(self) -> None:
+        self._start_worker("auto")
+
     def _start_worker(self, mode: str) -> None:
         if self.worker_thread and self.worker_thread.is_alive():
             self.log_queue.put("[GUI] Bot is already running.\n")
@@ -497,7 +520,15 @@ class ForsakenBotGUI:
         self.running_mode = mode
         self._apply_status("Preparing...", "running")
         self.set_running_state(True)
-        self.log_queue.put(f"[GUI] Starting {mode} mode.\n")
+        mode_label = {"single": "single", "continuous": "continuous", "auto": "auto-complete"}.get(mode, mode)
+        if mode == "auto":
+            self._has_confirmed_puzzle = False
+            self._waiting_displayed = True
+            self._set_preview_status("Waiting for puzzle...")
+            self._auto_solver_logging = False
+        else:
+            self._waiting_displayed = False
+        self.log_queue.put(f"[GUI] Starting {mode_label} mode.\n")
         self.worker_thread = threading.Thread(target=self._run_worker, args=(mode,), daemon=True)
         self.worker_thread.start()
 
@@ -521,6 +552,8 @@ class ForsakenBotGUI:
                     else:
                         self.log_queue.put("[GUI] No puzzle detected.\n")
                         self._update_status_async("No puzzle detected", "warning")
+                elif mode == "auto":
+                    self._run_auto_loop()
                 else:
                     self._run_continuous_loop()
         except bot.KillSwitchActivated:
@@ -543,6 +576,7 @@ class ForsakenBotGUI:
         puzzles_completed = 0
         final_status: Optional[Tuple[str, str]] = None
         while not self.stop_event.is_set():
+            self._auto_solver_logging = False
             self._set_preview_status("Capturing puzzle...")
             progress = lambda stage, img: self._handle_progress(stage, img)
             try:
@@ -586,6 +620,82 @@ class ForsakenBotGUI:
                 final_status = ("Ready", "ready")
         self._update_status_async(*final_status)
 
+    def _run_auto_loop(self) -> None:
+        self._update_status_async("Auto-complete mode active...", "running")
+        puzzles_completed = 0
+        waiting_logged = False
+        final_status: Optional[Tuple[str, str]] = None
+        idle_delay = getattr(bot, "AUTO_IDLE_DELAY", 0.5)
+        while not self.stop_event.is_set():
+            self._auto_solver_logging = False
+            progress = lambda stage, img: self._handle_progress(stage, img)
+            try:
+                success, debug_img = bot.run_one_puzzle(
+                    return_debug=True,
+                    progress_callback=progress,
+                    silent_no_puzzle=True,
+                )
+            except bot.KillSwitchActivated:
+                bot.reset_kill_switch()
+                self.log_queue.put("[GUI] Kill switch engaged, stopping auto-complete.\n")
+                self._update_status_async("Kill switch engaged", "warning")
+                self._set_preview_status("Kill switch engaged.")
+                final_status = ("Kill switch engaged", "warning")
+                break
+            if success:
+                puzzles_completed += 1
+                waiting_logged = False
+                self._waiting_displayed = False
+                self.log_queue.put(f"[GUI] Auto-complete solved puzzle {puzzles_completed}.\n")
+                if self.stop_event.is_set():
+                    final_status = ("Stopped", "ready")
+                    break
+                try:
+                    bot.scaled_sleep(0.35)
+                except bot.KillSwitchActivated:
+                    bot.reset_kill_switch()
+                    self.log_queue.put("[GUI] Kill switch engaged, stopping auto-complete.\n")
+                    self._update_status_async("Kill switch engaged", "warning")
+                    self._set_preview_status("Kill switch engaged.")
+                    final_status = ("Kill switch engaged", "warning")
+                    break
+                continue
+            had_puzzle = self._has_confirmed_puzzle
+            self._has_confirmed_puzzle = False
+            self._auto_solver_logging = False
+            if debug_img is not None and had_puzzle:
+                if self.running_mode == "auto":
+                    self._auto_solver_logging = True
+                self._waiting_displayed = False
+                self._update_preview_async(debug_img, "Detection issue. Waiting for puzzle...")
+            else:
+                if (not self._waiting_displayed) or (self.preview_last_message != "Waiting for puzzle..."):
+                    self._set_preview_status("Waiting for puzzle...")
+                self._waiting_displayed = True
+            if not waiting_logged:
+                self.log_queue.put("[GUI] Auto-complete waiting for puzzle...\n")
+                waiting_logged = True
+            if self.stop_event.is_set():
+                final_status = ("Stopped", "ready")
+                break
+            try:
+                bot.scaled_sleep(idle_delay)
+            except bot.KillSwitchActivated:
+                bot.reset_kill_switch()
+                self.log_queue.put("[GUI] Kill switch engaged, stopping auto-complete.\n")
+                self._update_status_async("Kill switch engaged", "warning")
+                self._set_preview_status("Kill switch engaged.")
+                final_status = ("Kill switch engaged", "warning")
+                break
+        if final_status is None:
+            if self.stop_event.is_set():
+                final_status = ("Stopped", "ready")
+            elif puzzles_completed:
+                final_status = ("Auto-complete idle", "ready")
+            else:
+                final_status = ("Ready", "ready")
+        self._update_status_async(*final_status)
+
     def stop(self) -> None:
         if not (self.worker_thread and self.worker_thread.is_alive()):
             return
@@ -597,10 +707,12 @@ class ForsakenBotGUI:
         if running:
             self.single_button.configure(state="disabled")
             self.continuous_button.configure(state="disabled")
+            self.auto_button.configure(state="disabled")
             self.stop_button.configure(state="normal")
         else:
             self.single_button.configure(state="normal")
             self.continuous_button.configure(state="normal")
+            self.auto_button.configure(state="normal")
             self.stop_button.configure(state="disabled")
 
     def _set_running_state_async(self, running: bool) -> None:
@@ -630,6 +742,11 @@ class ForsakenBotGUI:
         bot.set_smoothness(smoothness)
         self.smooth_value.configure(text=f"{bot.get_settings()['smoothness']:.2f}")
 
+    def _preview_updates_allowed(self) -> bool:
+        if self.running_mode != "auto":
+            return True
+        return self._auto_solver_logging or self._has_confirmed_puzzle
+
     def _set_preview_status(self, message: str) -> None:
         self.preview_last_message = message
         def updater(msg=message):
@@ -639,6 +756,8 @@ class ForsakenBotGUI:
         self.root.after(0, updater)
 
     def _update_preview_async(self, image, message: Optional[str] = None) -> None:
+        if not self._preview_updates_allowed():
+            return
         if image is not None:
             try:
                 payload = image.copy()
@@ -657,7 +776,33 @@ class ForsakenBotGUI:
             "paths_ready": "Paths ready. Executing...",
             "no_solution": "No valid solution found.",
             "killed": "Kill switch engaged.",
+            "no_puzzle": "No puzzle detected.",
+            "puzzle_missing": "Puzzle disappeared. Waiting...",
         }
+        if stage == "puzzle_captured":
+            if self.running_mode == "auto":
+                self._auto_solver_logging = False
+                self._has_confirmed_puzzle = False
+            else:
+                self._has_confirmed_puzzle = True
+            self._waiting_displayed = False
+        elif stage in {"puzzle_missing", "killed"}:
+            if self.running_mode == "auto":
+                self._auto_solver_logging = False
+            self._has_confirmed_puzzle = False
+        elif stage == "no_puzzle":
+            if self.running_mode == "auto":
+                self._auto_solver_logging = False
+            self._has_confirmed_puzzle = False
+            if self.running_mode in {"auto", "continuous"}:
+                return
+        if stage == "no_solution" and self.running_mode == "auto":
+            self._auto_solver_logging = False
+        if stage == "paths_ready" and self.running_mode == "auto":
+            self._auto_solver_logging = True
+        if stage.startswith("path_progress") and self.running_mode == "auto":
+            self._has_confirmed_puzzle = True
+            self._auto_solver_logging = True
         if stage == "no_puzzle":
             self._set_preview_status("No puzzle detected.")
             return
@@ -679,7 +824,15 @@ class ForsakenBotGUI:
                 self._set_preview_status(status)
             return
         message = stage_messages.get(stage)
+        if stage == "puzzle_missing":
+            msg = stage_messages.get(stage) or "Puzzle disappeared. Waiting..."
+            self._waiting_displayed = True
+            self._set_preview_status(msg)
+            return
         if stage == "paths_ready":
+            if self.running_mode == "auto":
+                self._auto_solver_logging = True
+            self._has_confirmed_puzzle = True
             if image is not None:
                 self._update_preview_async(image, message or "Paths ready. Executing...")
             elif message:
@@ -687,9 +840,17 @@ class ForsakenBotGUI:
             return
         if message:
             self._set_preview_status(message)
-
     def _set_puzzle_preview(self, image, message: Optional[str] = None) -> None:
+        if self.running_mode == "auto" and not self._preview_updates_allowed():
+            return
+        self._has_confirmed_puzzle = image is not None
+        if self.running_mode == "auto":
+            self._waiting_displayed = image is None
+        else:
+            self._waiting_displayed = False
         if image is None:
+            if self.running_mode == "auto" and not self._auto_solver_logging:
+                return
             self.preview_source_image = None
             self.current_puzzle_photo = None
             display_text = message or self.preview_placeholder
@@ -909,6 +1070,9 @@ class ForsakenBotGUI:
         elif action == "continuous":
             self.log_queue.put(f"[Hotkey] Triggering continuous mode ({self.hotkeys[action]}).\n")
             self.start_continuous()
+        elif action == "auto":
+            self.log_queue.put(f"[Hotkey] Triggering auto-complete ({self.hotkeys[action]}).\n")
+            self.start_auto()
         elif action == "stop":
             self.log_queue.put(f"[Hotkey] Triggering stop ({self.hotkeys[action]}).\n")
             self.stop()
@@ -953,12 +1117,10 @@ class ForsakenBotGUI:
     def _update_status_async(self, text: str, state: str) -> None:
         self.root.after(0, lambda: self._apply_status(text, state))
 
-
 def main() -> None:
     root = tk.Tk()
     app = ForsakenBotGUI(root)
     root.mainloop()
-
 
 if __name__ == "__main__":
     main()
