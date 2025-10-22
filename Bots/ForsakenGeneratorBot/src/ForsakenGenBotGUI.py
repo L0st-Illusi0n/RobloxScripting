@@ -540,10 +540,14 @@ class ForsakenBotGUI:
                     self._update_status_async("Executing puzzle...", "running")
                     self._set_preview_status("Capturing puzzle...")
                     progress = lambda stage, img: self._handle_progress(stage, img)
-                    success, debug_img = bot.run_one_puzzle(
-                        return_debug=True,
-                        progress_callback=progress,
-                    )
+                    try:
+                        success, debug_img = bot.run_one_puzzle(
+                            return_debug=True,
+                            progress_callback=progress,
+                        )
+                    except bot.MouseBlockedAtStart as exc:
+                        self._handle_blocked_cursor_event(exc)
+                        return
                     if debug_img is None and not success:
                         self._set_preview_status("No puzzle detected.")
                     if success:
@@ -584,6 +588,15 @@ class ForsakenBotGUI:
                     return_debug=True,
                     progress_callback=progress,
                 )
+            except bot.MouseBlockedAtStart as exc:
+                self._handle_blocked_cursor_event(exc)
+                if self.stop_event.wait(0.35):
+                    final_status = ("Stopped", "ready")
+                    break
+                if not self.stop_event.is_set():
+                    self._update_status_async("Continuous mode active...", "running")
+                    self._set_preview_status("Capturing puzzle...")
+                continue
             except bot.KillSwitchActivated:
                 bot.reset_kill_switch()
                 self.log_queue.put("[GUI] Kill switch engaged, stopping continuous mode.\n")
@@ -635,6 +648,18 @@ class ForsakenBotGUI:
                     progress_callback=progress,
                     silent_no_puzzle=True,
                 )
+            except bot.MouseBlockedAtStart as exc:
+                self._handle_blocked_cursor_event(exc)
+                waiting_logged = False
+                self._has_confirmed_puzzle = False
+                self._auto_solver_logging = False
+                if self.stop_event.wait(idle_delay):
+                    final_status = ("Stopped", "ready")
+                    break
+                if not self.stop_event.is_set():
+                    self._update_status_async("Auto-complete mode active...", "running")
+                    self._set_preview_status("Waiting for puzzle...")
+                continue
             except bot.KillSwitchActivated:
                 bot.reset_kill_switch()
                 self.log_queue.put("[GUI] Kill switch engaged, stopping auto-complete.\n")
@@ -755,6 +780,21 @@ class ForsakenBotGUI:
                 self.puzzle_label.configure(text=msg, bg=self.colors["preview_bg"], fg=self.colors["text"])
         self.root.after(0, updater)
 
+    def _handle_blocked_cursor_event(self, exc: Optional[BaseException] = None, *, log: bool = True) -> None:
+        position = getattr(exc, "position", None)
+        if position is not None:
+            try:
+                px, py = position  # type: ignore[misc]
+                position_text = f"({int(px)}, {int(py)})"
+            except Exception:
+                position_text = str(position)
+        else:
+            position_text = "a blocked position"
+        if log:
+            self.log_queue.put(f"[GUI] Cursor blocked at {position_text}. Move the mouse to continue.\n")
+        self._update_status_async("Cursor blocked", "warning")
+        self._set_preview_status("Cursor blocked. Move the mouse.")
+
     def _update_preview_async(self, image, message: Optional[str] = None) -> None:
         if not self._preview_updates_allowed():
             return
@@ -778,6 +818,7 @@ class ForsakenBotGUI:
             "killed": "Kill switch engaged.",
             "no_puzzle": "No puzzle detected.",
             "puzzle_missing": "Puzzle disappeared. Waiting...",
+            "mouse_blocked": "Cursor blocked. Move the mouse.",
         }
         if stage == "puzzle_captured":
             if self.running_mode == "auto":
@@ -790,6 +831,12 @@ class ForsakenBotGUI:
             if self.running_mode == "auto":
                 self._auto_solver_logging = False
             self._has_confirmed_puzzle = False
+        elif stage == "mouse_blocked":
+            if self.running_mode == "auto":
+                self._auto_solver_logging = False
+                self._has_confirmed_puzzle = False
+            self._handle_blocked_cursor_event(log=False)
+            return
         elif stage == "no_puzzle":
             if self.running_mode == "auto":
                 self._auto_solver_logging = False

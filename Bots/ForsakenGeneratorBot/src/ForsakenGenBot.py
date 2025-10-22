@@ -16,9 +16,19 @@ class KillSwitchActivated(Exception):
 class PuzzleNotAvailable(Exception):
     pass
 
+class MouseBlockedAtStart(Exception):
+    def __init__(self, position):
+        normalized = (int(position[0]), int(position[1]))
+        self.position = normalized
+        super().__init__(f"Mouse at blocked start position {normalized}.")
+
+class MouseMovementStalled(Exception):
+    pass
+
 kill_switch_event = Event()
 _kill_switch_handle = None
 _puzzle_monitor = None
+_mouse_monitor = None
 
 def engage_kill_switch():
     if kill_switch_event.is_set():
@@ -43,6 +53,17 @@ def clear_puzzle_monitor():
     global _puzzle_monitor
     _puzzle_monitor = None
 
+def set_mouse_monitor(monitor):
+    global _mouse_monitor
+    _mouse_monitor = monitor
+
+def clear_mouse_monitor():
+    global _mouse_monitor
+    _mouse_monitor = None
+
+def get_mouse_monitor():
+    return _mouse_monitor
+
 def get_puzzle_monitor():
     return _puzzle_monitor
 
@@ -52,6 +73,9 @@ def abort_if_killed():
     monitor = _puzzle_monitor
     if monitor is not None:
         monitor.ensure_present()
+    movement_monitor = _mouse_monitor
+    if movement_monitor is not None:
+        movement_monitor.ensure_active()
 
 def _register_kill_switch_hotkey():
     global _kill_switch_handle
@@ -87,6 +111,11 @@ SPEED = 0.95
 JITTER_SCALE = 0.6
 SMOOTHNESS = 0.55
 AUTO_IDLE_DELAY = 0.5
+MOUSE_STALL_TIMEOUT = 10
+BLOCKED_CURSOR_POSITIONS = {
+    (960, 540),
+    (960, 527),
+}
 def set_speed(value):
     global SPEED
     try:
@@ -130,6 +159,7 @@ def scaled_sleep(base_time):
     abort_if_killed()
 
 def move_to(x, y):
+    ensure_cursor_not_blocked()
     abort_if_killed()
     interception.move_to(int(x), int(y))
 
@@ -154,6 +184,26 @@ def get_cursor_pos():
     ctypes.windll.user32.GetCursorPos(ctypes.byref(pt))
     return pt.x, pt.y
 
+def handle_blocked_cursor(position):
+    print(f"Blocked cursor detected at {tuple(int(v) for v in position)}. Custom handler invoked.")
+    interception.key_down("w")
+    time.sleep(0.2)
+    interception.key_up("w")
+
+def is_blocked_cursor_position(position):
+    try:
+        x, y = position
+    except (TypeError, ValueError):
+        return False
+    return (int(x), int(y)) in BLOCKED_CURSOR_POSITIONS
+
+def ensure_cursor_not_blocked():
+    position = get_cursor_pos()
+    if is_blocked_cursor_position(position):
+        handle_blocked_cursor(position)
+        raise MouseBlockedAtStart(position)
+    return position
+
 SEARCH_REGION = {
     "top": 200,
     "left": 400,
@@ -171,6 +221,7 @@ def smoothstep(t):
     return t * t * (3 - 2 * t)
 
 def smooth_move_to(target, duration=0.2, jitter=False):
+    ensure_cursor_not_blocked()
     abort_if_killed()
     start_x, start_y = get_cursor_pos()
     dx = target[0] - start_x
@@ -182,6 +233,7 @@ def smooth_move_to(target, duration=0.2, jitter=False):
     jitter_amount = max(0.0, JITTER_SCALE) * 0.7
     for step in range(1, steps + 1):
         abort_if_killed()
+        ensure_cursor_not_blocked()
         t = step / steps
         eased = smoothstep(t)
         x = start_x + dx * eased
@@ -192,6 +244,7 @@ def smooth_move_to(target, duration=0.2, jitter=False):
         interception.move_to(int(x), int(y))
         scaled_sleep(delay)
     abort_if_killed()
+    ensure_cursor_not_blocked()
     interception.move_to(int(target[0]), int(target[1]))
 
 TOLERANCE = 0
@@ -212,6 +265,79 @@ def find_puzzle_bbox(img):
         return None
     largest = max(contours, key=cv2.contourArea)
     return cv2.boundingRect(largest)
+
+class MouseMovementMonitor:
+    def __init__(self, idle_timeout=1.0):
+        try:
+            idle = float(idle_timeout)
+        except (TypeError, ValueError):
+            idle = 1.0
+        self.idle_timeout = max(0.01, idle)
+        self._active = False
+        self._last_position = None
+        self._last_change_ts = 0.0
+        self._handlers = []
+        self.add_handler(self._default_handler)
+
+    @property
+    def active(self):
+        return self._active
+
+    def start(self):
+        self._active = True
+        self._last_position = None
+        self._last_change_ts = time.monotonic()
+
+    def stop(self):
+        self._active = False
+        self._last_position = None
+
+    def ensure_active(self):
+        if not self._active:
+            return
+        now = time.monotonic()
+        try:
+            current = pyautogui.position()
+        except Exception:
+            return
+        position = (int(current.x), int(current.y))
+        if self._last_position is None or position != self._last_position:
+            self._last_position = position
+            self._last_change_ts = now
+            return
+        if now - self._last_change_ts >= self.idle_timeout:
+            self._trigger(position)
+
+    def add_handler(self, handler, *, prepend=False):
+        if not callable(handler):
+            return
+        if prepend:
+            self._handlers.insert(0, handler)
+        else:
+            self._handlers.append(handler)
+
+    def _trigger(self, frozen_position):
+        self._active = False
+        captured_exc = None
+        for handler in list(self._handlers):
+            try:
+                handler(self, frozen_position)
+            except MouseMovementStalled as exc:
+                if captured_exc is None:
+                    captured_exc = exc
+            except Exception as exc:
+                if captured_exc is None:
+                    captured_exc = exc
+        if captured_exc is not None:
+            raise captured_exc
+        raise MouseMovementStalled(
+            f"Mouse movement stalled at {frozen_position} for {self.idle_timeout:.2f}s."
+        )
+
+    def _default_handler(self, monitor, frozen_position):
+        raise MouseMovementStalled(
+            f"Mouse movement stalled at {frozen_position} for {monitor.idle_timeout:.2f}s."
+        )
 
 class PuzzlePresenceMonitor:
     def __init__(self, bbox, tolerance=25, check_interval=0.3):
@@ -1059,27 +1185,36 @@ def execute_single_path(color, cells, h_lines, v_lines, origin_x, origin_y, prog
 
 def execute_all_paths(solutions, h_lines, v_lines, origin_x, origin_y, progress_callback=None, progress_visualizer=None):
     abort_if_killed()
-    remaining = dict(solutions)
-    while remaining:
-        abort_if_killed()
-        ordered = order_paths_nearest_mouse(remaining, h_lines, v_lines, origin_x, origin_y)
-        if not ordered:
-            break
-        color, path, entry_index = ordered[0]
-        if entry_index == -1:
-            path = list(reversed(path))
-        print(f"Executing path for {color}...")
-        execute_single_path(
-            color,
-            path,
-            h_lines,
-            v_lines,
-            origin_x,
-            origin_y,
-            progress_callback=progress_callback,
-            progress_visualizer=progress_visualizer,
-        )
-        del remaining[color]
+    ensure_cursor_not_blocked()
+    movement_monitor = MouseMovementMonitor(idle_timeout=MOUSE_STALL_TIMEOUT)
+    set_mouse_monitor(movement_monitor)
+    movement_monitor.start()
+    try:
+        remaining = dict(solutions)
+        while remaining:
+            abort_if_killed()
+            ordered = order_paths_nearest_mouse(remaining, h_lines, v_lines, origin_x, origin_y)
+            if not ordered:
+                break
+            color, path, entry_index = ordered[0]
+            if entry_index == -1:
+                path = list(reversed(path))
+            print(f"Executing path for {color}...")
+            execute_single_path(
+                color,
+                path,
+                h_lines,
+                v_lines,
+                origin_x,
+                origin_y,
+                progress_callback=progress_callback,
+                progress_visualizer=progress_visualizer,
+            )
+            del remaining[color]
+    finally:
+        movement_monitor.stop()
+        if get_mouse_monitor() is movement_monitor:
+            clear_mouse_monitor()
 
 def run_one_puzzle(return_debug=False, progress_callback=None, silent_no_puzzle=False):
     def _result(success, debug_image=None):
@@ -1169,12 +1304,21 @@ def run_one_puzzle(return_debug=False, progress_callback=None, silent_no_puzzle=
         print(message)
         _emit("puzzle_missing", None)
         return _result(False, debug_image)
+    except MouseBlockedAtStart:
+        _emit("mouse_blocked", None)
+        raise
+    except MouseMovementStalled as exc:
+        message = str(exc).strip() or "Mouse movement stalled. Canceling puzzle."
+        print(message)
+        _emit("mouse_stalled", None)
+        return _result(False, debug_image)
     except KillSwitchActivated:
         print("Kill switch engaged. Canceling current puzzle.")
         _emit("killed", None)
         raise
     finally:
         clear_puzzle_monitor()
+        clear_mouse_monitor()
 
 def main():
     print(f"Ready. Press PgDn for one puzzle, PgUp for continuous mode, Home for auto-complete. Press end to quit after current action. Press {KILL_SWITCH_KEY} to halt instantly.")
@@ -1193,6 +1337,9 @@ def main():
             try:
                 reset_kill_switch()
                 run_one_puzzle()
+            except MouseBlockedAtStart as exc:
+                _ = exc
+                reset_kill_switch()
             except KillSwitchActivated:
                 print("Kill switch engaged. Single puzzle canceled.")
                 reset_kill_switch()
@@ -1202,6 +1349,10 @@ def main():
                 try:
                     reset_kill_switch()
                     success = run_one_puzzle(silent_no_puzzle=True)
+                except MouseBlockedAtStart as exc:
+                    _ = exc
+                    reset_kill_switch()
+                    continue
                 except KillSwitchActivated:
                     print("Kill switch engaged. Stopping continuous mode.")
                     reset_kill_switch()
@@ -1233,6 +1384,10 @@ def main():
                 try:
                     reset_kill_switch()
                     success = run_one_puzzle(silent_no_puzzle=True)
+                except MouseBlockedAtStart as exc:
+                    _ = exc
+                    reset_kill_switch()
+                    continue
                 except KillSwitchActivated:
                     print("Kill switch engaged. Stopping auto-complete mode.")
                     reset_kill_switch()
