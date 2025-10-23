@@ -856,6 +856,10 @@ class ForsakenBotGUI:
         if stage == "killed":
             self._set_preview_status("Kill switch engaged.")
             return
+        if stage.startswith("cursor_trail"):
+            if image is not None:
+                self._update_preview_async(image, self.preview_last_message)
+            return
         if stage.startswith("path_progress"):
             parts = stage.split("|")
             color = parts[1] if len(parts) > 1 else None

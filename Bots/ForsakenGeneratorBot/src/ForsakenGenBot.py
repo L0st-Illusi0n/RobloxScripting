@@ -5,7 +5,8 @@ import numpy as np
 import pyautogui
 import keyboard
 from collections import deque
-from threading import Event
+from threading import Event, Thread, RLock
+from typing import Optional
 import interception
 import time, random
 interception.auto_capture_devices(keyboard=True, mouse=True)
@@ -220,10 +221,15 @@ CORE_CROP_RATIO = 0.15
 def smoothstep(t):
     return t * t * (3 - 2 * t)
 
-def smooth_move_to(target, duration=0.2, jitter=False):
+def smooth_move_to(target, duration=0.2, jitter=False, position_callback=None):
     ensure_cursor_not_blocked()
     abort_if_killed()
     start_x, start_y = get_cursor_pos()
+    if position_callback is not None:
+        try:
+            position_callback((int(start_x), int(start_y)))
+        except Exception:
+            pass
     dx = target[0] - start_x
     dy = target[1] - start_y
     distance = max(1.0, (dx**2 + dy**2) ** 0.5)
@@ -241,11 +247,23 @@ def smooth_move_to(target, duration=0.2, jitter=False):
         if jitter and step < steps and jitter_amount > 0:
             x += random.uniform(-jitter_amount, jitter_amount)
             y += random.uniform(-jitter_amount, jitter_amount)
-        interception.move_to(int(x), int(y))
+        ix, iy = int(x), int(y)
+        interception.move_to(ix, iy)
+        if position_callback is not None:
+            try:
+                position_callback(get_cursor_pos())
+            except Exception:
+                pass
         scaled_sleep(delay)
     abort_if_killed()
     ensure_cursor_not_blocked()
-    interception.move_to(int(target[0]), int(target[1]))
+    tx, ty = int(target[0]), int(target[1])
+    interception.move_to(tx, ty)
+    if position_callback is not None:
+        try:
+            position_callback(get_cursor_pos())
+        except Exception:
+            pass
 
 TOLERANCE = 0
 def color_match(pixel, target, tol=TOLERANCE):
@@ -948,11 +966,27 @@ def draw_paths(debug_img, paths, h_lines, v_lines, color_map):
             cv2.circle(debug_img, centers[i], 6, color_bgr, -1)
         cv2.circle(debug_img, centers[-1], 6, color_bgr, -1)
 class PathProgressVisualizer:
-    def __init__(self, base_image, h_lines, v_lines, color_map, alpha=0.45):
+    @staticmethod
+    def _copy_image(image):
+        if image is None:
+            return None
         try:
-            self.base_image = base_image.copy()
+            return image.copy()
         except AttributeError:
-            self.base_image = base_image
+            return image
+
+    def __init__(
+        self,
+        base_image,
+        h_lines,
+        v_lines,
+        color_map,
+        alpha=0.45,
+        origin=None,
+        trail_thickness=5,
+    ):
+        self._lock = RLock()
+        self.base_image = self._copy_image(base_image)
         self.h_lines = list(h_lines)
         self.v_lines = list(v_lines)
         self.color_map = dict(color_map or {})
@@ -962,16 +996,110 @@ class PathProgressVisualizer:
             alpha_value = 0.45
         self.alpha = max(0.1, min(0.85, alpha_value))
         self.completed = {}
+        try:
+            ox, oy = origin if origin is not None else (0, 0)
+        except Exception:
+            ox, oy = 0, 0
+        self.origin_x = int(ox)
+        self.origin_y = int(oy)
+        try:
+            thickness = int(round(trail_thickness))
+        except (TypeError, ValueError):
+            thickness = 3
+        self.trail_thickness = max(1, thickness)
+        self._trail_history = {}
+        self._active_trail_color = None
+        self._active_trail_points = []
 
-    def update_base(self, base_image):
+    def _set_origin_locked(self, origin):
+        try:
+            ox, oy = origin
+        except Exception:
+            return
+        self.origin_x = int(ox)
+        self.origin_y = int(oy)
+
+    def set_origin(self, origin):
+        if origin is None:
+            return
+        with self._lock:
+            self._set_origin_locked(origin)
+
+    def _reset_trails_locked(self):
+        self._trail_history.clear()
+        self._active_trail_color = None
+        self._active_trail_points = []
+
+    def reset_trails(self):
+        with self._lock:
+            self._reset_trails_locked()
+
+    def project_global(self, position):
+        if position is None:
+            return None
+        with self._lock:
+            if self.base_image is None:
+                return None
+            try:
+                px, py = position
+            except (TypeError, ValueError):
+                return None
+            local_x = int(round(px - self.origin_x))
+            local_y = int(round(py - self.origin_y))
+            height, width = self.base_image.shape[:2]
+            if local_x < 0 or local_y < 0 or local_x >= width or local_y >= height:
+                return None
+            return local_x, local_y
+
+    def begin_trail(self, color_label):
+        with self._lock:
+            self._commit_active_trail_locked()
+            self._active_trail_color = color_label
+            self._active_trail_points = []
+
+    def add_mouse_point(self, position):
+        with self._lock:
+            if self.base_image is None or self._active_trail_color is None:
+                return None
+            local = self.project_global(position)
+            if local is None:
+                return None
+            local_x, local_y = local
+            if self._active_trail_points:
+                last_x, last_y = self._active_trail_points[-1]
+                if local_x == last_x and local_y == last_y:
+                    return local
+            self._active_trail_points.append((local_x, local_y))
+            return local
+
+    def end_trail(self):
+        with self._lock:
+            self._commit_active_trail_locked()
+            self._active_trail_color = None
+            self._active_trail_points = []
+
+    def _commit_active_trail_locked(self):
+        if self._active_trail_color is None:
+            self._active_trail_points = []
+            return
+        if len(self._active_trail_points) < 2:
+            self._active_trail_points = []
+            return
+        color_trails = self._trail_history.setdefault(self._active_trail_color, [])
+        color_trails.append(list(self._active_trail_points))
+        self._active_trail_points = []
+
+    def update_base(self, base_image, origin=None, *, reset_trails=False):
         if base_image is None:
             return
-        try:
-            self.base_image = base_image.copy()
-        except AttributeError:
-            self.base_image = base_image
+        with self._lock:
+            self.base_image = self._copy_image(base_image)
+            if origin is not None:
+                self._set_origin_locked(origin)
+            if reset_trails:
+                self._reset_trails_locked()
 
-    def _cell_bounds(self, row, col):
+    def _cell_bounds_locked(self, row, col):
         if row < 0 or col < 0:
             return None
         if row >= len(self.h_lines) - 1 or col >= len(self.v_lines) - 1:
@@ -983,34 +1111,186 @@ class PathProgressVisualizer:
     def mark_cell(self, cell, color_label):
         if cell is None or color_label is None:
             return
-        self.completed[cell] = color_label
+        with self._lock:
+            self.completed[cell] = color_label
+
+    def _draw_trails_locked(self, canvas):
+        if self.base_image is None:
+            return
+        for color_label, segments in self._trail_history.items():
+            sanitized = [segment for segment in segments if segment]
+            if not sanitized:
+                continue
+            color_bgr = self.color_map.get(color_label, (255, 255, 255))
+            self._render_segments_locked(canvas, sanitized, color_bgr, active=False)
+        if self._active_trail_color and self._active_trail_points:
+            color_bgr = self.color_map.get(self._active_trail_color, (255, 255, 255))
+            active_segment = [self._active_trail_points[:]]
+            self._render_segments_locked(canvas, active_segment, color_bgr, active=True)
+
+    def _render_segments_locked(self, canvas, segments, color, active=False):
+        if not segments:
+            return
+        base_thickness = max(2, self.trail_thickness + (1 if active else 0))
+        def _scale(col, factor=1.0, offset=0):
+            return tuple(
+                max(0, min(255, int(round(channel * factor + offset))))
+                for channel in col
+            )
+        glow_color = _scale(color, 0.85, 10)
+        shadow_color = _scale(color, 0.55, -15)
+        stroke_color = _scale(color, 1.15, 25)
+        highlight_color = _scale(color, 1.25 if active else 1.1, 45 if active else 35)
+        point_radius = max(3, base_thickness // 2 + (2 if active else 1))
+        overlay = np.zeros_like(canvas)
+        overlay_drawn = False
+        for segment in segments:
+            if len(segment) < 2:
+                continue
+            pts = np.array(segment, dtype=np.int32).reshape((-1, 1, 2))
+            cv2.polylines(
+                overlay,
+                [pts],
+                False,
+                glow_color,
+                thickness=base_thickness + 6,
+                lineType=cv2.LINE_AA,
+            )
+            overlay_drawn = True
+        if overlay_drawn:
+            glow = cv2.GaussianBlur(overlay, (0, 0), sigmaX=3, sigmaY=3)
+            cv2.addWeighted(glow, 0.35 if active else 0.25, canvas, 1.0, 0, canvas)
+        for segment in segments:
+            if not segment:
+                continue
+            if len(segment) >= 2:
+                pts = np.array(segment, dtype=np.int32).reshape((-1, 1, 2))
+                cv2.polylines(
+                    canvas,
+                    [pts],
+                    False,
+                    shadow_color,
+                    thickness=base_thickness + 2,
+                    lineType=cv2.LINE_AA,
+                )
+                cv2.polylines(
+                    canvas,
+                    [pts],
+                    False,
+                    stroke_color,
+                    thickness=base_thickness,
+                    lineType=cv2.LINE_AA,
+                )
+            for px, py in segment:
+                center = (int(px), int(py))
+                cv2.circle(canvas, center, point_radius + 2, shadow_color, -1, lineType=cv2.LINE_AA)
+                cv2.circle(canvas, center, point_radius, highlight_color, -1, lineType=cv2.LINE_AA)
+        tip_source = segments[-1][-1] if segments and segments[-1] else None
+        if active and tip_source is not None:
+            tip_center = (int(tip_source[0]), int(tip_source[1]))
+            cv2.circle(canvas, tip_center, point_radius + 3, shadow_color, -1, lineType=cv2.LINE_AA)
+            cv2.circle(canvas, tip_center, point_radius + 1, highlight_color, -1, lineType=cv2.LINE_AA)
+            cv2.circle(canvas, tip_center, max(point_radius - 1, 2), (255, 255, 255), -1, lineType=cv2.LINE_AA)
 
     def snapshot(self, current_cell=None, current_color=None, label=None):
-        if self.base_image is None:
-            return None
-        canvas = self.base_image.copy()
-        overlay = np.zeros_like(canvas)
-        for (row, col), color_label in self.completed.items():
-            bounds = self._cell_bounds(row, col)
-            if bounds is None:
-                continue
-            x1, y1, x2, y2 = bounds
-            cell_color = self.color_map.get(color_label, (255, 255, 255))
-            cv2.rectangle(overlay, (x1, y1), (x2, y2), cell_color, -1)
-        cv2.addWeighted(overlay, self.alpha, canvas, 1 - self.alpha, 0, canvas)
-        if current_cell is not None:
-            bounds = self._cell_bounds(*current_cell)
-            if bounds is not None:
+        with self._lock:
+            if self.base_image is None:
+                return None
+            canvas = self.base_image.copy()
+            overlay = np.zeros_like(canvas)
+            for (row, col), color_label in self.completed.items():
+                bounds = self._cell_bounds_locked(row, col)
+                if bounds is None:
+                    continue
                 x1, y1, x2, y2 = bounds
-                highlight_color = self.color_map.get(current_color, (255, 255, 255))
-                accent = tuple(int(min(255, channel + 60)) for channel in highlight_color)
-                cv2.rectangle(canvas, (x1, y1), (x2, y2), accent, 2)
-        if label:
-            padding = 8
-            text_box_width = padding * 2 + int(len(label) * 9.5)
-            cv2.rectangle(canvas, (8, 8), (8 + text_box_width, 40), (0, 0, 0), -1)
-            cv2.putText(canvas, label, (12, 32), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1, cv2.LINE_AA)
-        return canvas
+                cell_color = self.color_map.get(color_label, (255, 255, 255))
+                cv2.rectangle(overlay, (x1, y1), (x2, y2), cell_color, -1)
+            cv2.addWeighted(overlay, self.alpha, canvas, 1 - self.alpha, 0, canvas)
+            self._draw_trails_locked(canvas)
+            if current_cell is not None:
+                bounds = self._cell_bounds_locked(*current_cell)
+                if bounds is not None:
+                    x1, y1, x2, y2 = bounds
+                    highlight_color = self.color_map.get(current_color, (255, 255, 255))
+                    accent = tuple(int(min(255, channel + 70)) for channel in highlight_color)
+                    cv2.rectangle(canvas, (x1, y1), (x2, y2), accent, 2)
+            if label:
+                padding = 8
+                text_box_width = padding * 2 + int(len(label) * 9.5)
+                cv2.rectangle(canvas, (8, 8), (8 + text_box_width, 40), (0, 0, 0), -1)
+                cv2.putText(canvas, label, (12, 32), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1, cv2.LINE_AA)
+            return canvas
+
+class CursorTrailMonitor:
+    def __init__(self, visualizer, progress_callback=None, interval=0.016):
+        self.visualizer = visualizer
+        self.progress_callback = progress_callback
+        try:
+            self.interval = max(0.006, float(interval))
+        except (TypeError, ValueError):
+            self.interval = 0.016
+        self._stop_event = Event()
+        self._thread: Optional[Thread] = None
+        self._context_lock = RLock()
+        self._label: str = ""
+        self._highlight_cell = None
+        self._color = None
+
+    def start(self):
+        if self._thread is not None and self._thread.is_alive():
+            return
+        self._stop_event.clear()
+        self._thread = Thread(target=self._run, name="CursorTrailMonitor", daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        self._stop_event.set()
+        if self._thread is not None:
+            self._thread.join(timeout=0.5)
+        self._thread = None
+        self.clear_context()
+
+    def clear_context(self):
+        with self._context_lock:
+            self._label = ""
+            self._highlight_cell = None
+            self._color = None
+
+    def set_context(self, *, color=None, highlight=None, label=None):
+        with self._context_lock:
+            if color is not None:
+                self._color = color
+            if highlight is not None:
+                self._highlight_cell = highlight
+            if label is not None:
+                self._label = label
+
+    def _run(self):
+        last_emit = 0.0
+        while not self._stop_event.is_set():
+            position = get_cursor_pos()
+            local = self.visualizer.add_mouse_point(position)
+            if local is not None and self.progress_callback is not None:
+                now = time.perf_counter()
+                if now - last_emit >= self.interval:
+                    with self._context_lock:
+                        label = self._label
+                        highlight = self._highlight_cell
+                        color = self._color
+                    cursor_text = f"Cursor {int(position[0])},{int(position[1])} | Puzzle {local[0]},{local[1]}"
+                    display_label = f"{label} | {cursor_text}" if label else cursor_text
+                    frame = self.visualizer.snapshot(
+                        current_cell=highlight,
+                        current_color=color,
+                        label=display_label,
+                    )
+                    if frame is not None:
+                        try:
+                            self.progress_callback("cursor_trail|monitor", frame)
+                        except Exception:
+                            pass
+                        last_emit = now
+            self._stop_event.wait(self.interval)
 
 def cell_center(row, col, h_lines, v_lines, origin_x, origin_y):
     x1 = origin_x + v_lines[col]
@@ -1093,11 +1373,74 @@ def interpolate_segment(p1, p2, steps=12, curve=True):
         points.append((int(x), int(y)))
     return points
 
-def drag_path(color, cells, centers, hold=True, progress_callback=None, progress_visualizer=None):
+def drag_path(
+    color,
+    cells,
+    centers,
+    hold=True,
+    progress_callback=None,
+    progress_visualizer=None,
+    trail_monitor=None,
+):
     if not centers or len(centers) < 2:
         return
     abort_if_killed()
-    smooth_move_to(centers[0], duration=0.15 * SPEED, jitter=False)
+    current_highlight_cell = cells[0] if cells else None
+    last_progress_label = None
+    use_monitor = (
+        trail_monitor is not None
+        and progress_callback is not None
+        and progress_visualizer is not None
+    )
+    snapshot_interval = 0.02
+    last_snapshot = 0.0
+
+    if progress_visualizer is not None:
+        progress_visualizer.begin_trail(color)
+
+    def emit_snapshot(label=None, *, force=False):
+        nonlocal last_snapshot
+        if use_monitor or progress_callback is None or progress_visualizer is None:
+            return
+        now = time.monotonic()
+        if not force and (now - last_snapshot) < snapshot_interval:
+            return
+        display_label = label or last_progress_label or f"{color}"
+        frame = progress_visualizer.snapshot(
+            current_cell=current_highlight_cell,
+            current_color=color,
+            label=display_label,
+        )
+        if frame is None:
+            return
+        try:
+            progress_callback(f"cursor_trail|{color}", frame)
+        except Exception:
+            pass
+        last_snapshot = now
+
+    def record_point(position=None, *, force=False):
+        if progress_visualizer is None:
+            return
+        if position is None:
+            position = get_cursor_pos()
+        local = progress_visualizer.add_mouse_point(position)
+        if local is None:
+            return
+        if not use_monitor:
+            emit_snapshot(force=force)
+
+    if use_monitor:
+        trail_monitor.set_context(color=color, highlight=current_highlight_cell, label=None)
+
+    trail_callback = (lambda pos: record_point(pos)) if progress_visualizer is not None else None
+    smooth_move_to(
+        centers[0],
+        duration=0.15 * SPEED,
+        jitter=False,
+        position_callback=trail_callback,
+    )
+    record_point(force=True)
     scaled_sleep(0.01)
     mouse_is_down = False
     try:
@@ -1109,6 +1452,7 @@ def drag_path(color, cells, centers, hold=True, progress_callback=None, progress
         total_steps = len(cells) if cells else 0
 
         def send_progress(step_index):
+            nonlocal last_progress_label, current_highlight_cell
             if (
                 progress_callback is None
                 or progress_visualizer is None
@@ -1125,18 +1469,31 @@ def drag_path(color, cells, centers, hold=True, progress_callback=None, progress
                 progress_callback(f"path_progress|{color}|{step_index}|{total_steps}", frame)
             except Exception:
                 pass
+            last_progress_label = label
+            current_highlight_cell = cell
+            if use_monitor:
+                trail_monitor.set_context(highlight=current_highlight_cell, label=label)
+            else:
+                emit_snapshot(label=label, force=True)
 
         if total_steps:
             send_progress(1)
+            record_point(force=True)
         for i in range(len(centers) - 1):
             abort_if_killed()
             segment = interpolate_segment(centers[i], centers[i + 1], steps=10)
-            for j, (px, py) in enumerate(segment):
+            target_index = min(i + 1, len(cells) - 1)
+            for px, py in segment:
                 abort_if_killed()
-                interception.move_to(px, py)
+                interception.move_to(int(px), int(py))
+                current_highlight_cell = cells[target_index]
+                if use_monitor:
+                    trail_monitor.set_context(highlight=current_highlight_cell)
+                record_point()
                 scaled_sleep(0.0025 + random.uniform(-0.0005, 0.0005))
             if total_steps:
                 send_progress(i + 2)
+                record_point(force=True)
             if i < len(centers) - 2:
                 abort_if_killed()
                 dx1 = centers[i + 1][0] - centers[i][0]
@@ -1151,6 +1508,14 @@ def drag_path(color, cells, centers, hold=True, progress_callback=None, progress
             scaled_sleep(0.01)
             abort_if_killed()
     finally:
+        if progress_visualizer is not None:
+            final_cell = cells[-1] if cells else current_highlight_cell
+            record_point(force=True)
+            if use_monitor:
+                trail_monitor.set_context(highlight=final_cell, label=last_progress_label)
+            else:
+                emit_snapshot(label=last_progress_label, force=True)
+            progress_visualizer.end_trail()
         if hold and mouse_is_down:
             try:
                 mouse_up()
@@ -1168,7 +1533,17 @@ def drag_path(color, cells, centers, hold=True, progress_callback=None, progress
             except Exception:
                 pass
 
-def execute_single_path(color, cells, h_lines, v_lines, origin_x, origin_y, progress_callback=None, progress_visualizer=None):
+def execute_single_path(
+    color,
+    cells,
+    h_lines,
+    v_lines,
+    origin_x,
+    origin_y,
+    progress_callback=None,
+    progress_visualizer=None,
+    trail_monitor=None,
+):
     if len(cells) < 2:
         print("Path too short, skipping.")
         return
@@ -1181,9 +1556,19 @@ def execute_single_path(color, cells, h_lines, v_lines, origin_x, origin_y, prog
         hold=True,
         progress_callback=progress_callback,
         progress_visualizer=progress_visualizer,
+        trail_monitor=trail_monitor,
     )
 
-def execute_all_paths(solutions, h_lines, v_lines, origin_x, origin_y, progress_callback=None, progress_visualizer=None):
+def execute_all_paths(
+    solutions,
+    h_lines,
+    v_lines,
+    origin_x,
+    origin_y,
+    progress_callback=None,
+    progress_visualizer=None,
+    trail_monitor=None,
+):
     abort_if_killed()
     ensure_cursor_not_blocked()
     movement_monitor = MouseMovementMonitor(idle_timeout=MOUSE_STALL_TIMEOUT)
@@ -1209,6 +1594,7 @@ def execute_all_paths(solutions, h_lines, v_lines, origin_x, origin_y, progress_
                 origin_y,
                 progress_callback=progress_callback,
                 progress_visualizer=progress_visualizer,
+                trail_monitor=trail_monitor,
             )
             del remaining[color]
     finally:
@@ -1231,6 +1617,7 @@ def run_one_puzzle(return_debug=False, progress_callback=None, silent_no_puzzle=
             pass
     debug_image = None
     monitor = None
+    cursor_monitor: Optional[CursorTrailMonitor] = None
     try:
         try:
             screenshot = capture_region()
@@ -1261,7 +1648,15 @@ def run_one_puzzle(return_debug=False, progress_callback=None, silent_no_puzzle=
         _emit("points_detected", debug.copy())
         progress_visualizer = None
         if progress_callback is not None:
-            progress_visualizer = PathProgressVisualizer(debug.copy(), h_lines, v_lines, color_map)
+            progress_visualizer = PathProgressVisualizer(
+                debug.copy(),
+                h_lines,
+                v_lines,
+                color_map,
+                origin=(origin_x, origin_y),
+            )
+            cursor_monitor = CursorTrailMonitor(progress_visualizer, progress_callback)
+            cursor_monitor.start()
         print("\nDetected points:")
         for d in detected:
             print(f"Row {d[0]}, Col {d[1]} -> {d[2]}")
@@ -1279,7 +1674,7 @@ def run_one_puzzle(return_debug=False, progress_callback=None, silent_no_puzzle=
             debug_image = preview.copy()
             _emit("paths_ready", preview.copy())
             if progress_visualizer is not None:
-                progress_visualizer.update_base(preview)
+                progress_visualizer.update_base(preview, origin=(origin_x, origin_y), reset_trails=True)
             for color, path in solutions.items():
                 print(f"Path for {color}: {path}")
             execute_all_paths(
@@ -1290,6 +1685,7 @@ def run_one_puzzle(return_debug=False, progress_callback=None, silent_no_puzzle=
                 origin_y,
                 progress_callback=progress_callback,
                 progress_visualizer=progress_visualizer,
+                trail_monitor=cursor_monitor,
             )
         else:
             print("Solver could not find a valid set of paths.")
@@ -1317,6 +1713,8 @@ def run_one_puzzle(return_debug=False, progress_callback=None, silent_no_puzzle=
         _emit("killed", None)
         raise
     finally:
+        if cursor_monitor is not None:
+            cursor_monitor.stop()
         clear_puzzle_monitor()
         clear_mouse_monitor()
 
