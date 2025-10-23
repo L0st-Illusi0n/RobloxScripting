@@ -111,12 +111,23 @@ _register_kill_switch_hotkey()
 SPEED = 0.95
 JITTER_SCALE = 0.6
 SMOOTHNESS = 0.55
+STEPS = 7
+HUMAN_CURVE = 0.65
+STEP_NOISE_PX = 0.6
+OVERSHOOT_PROB = 0.30
+OVERSHOOT_MAX_PX = 14
+SETTLE_MICRO_PX = 6
+MIN_JERK = True
+PATH_STEP_PX = 14.0
+TIME_PER_PX  = 0.0011
+MIN_PER_STEP = 0.0020
 AUTO_IDLE_DELAY = 0.5
 MOUSE_STALL_TIMEOUT = 10
 BLOCKED_CURSOR_POSITIONS = {
     (960, 540),
     (960, 527),
 }
+
 def set_speed(value):
     global SPEED
     try:
@@ -205,6 +216,159 @@ def ensure_cursor_not_blocked():
         raise MouseBlockedAtStart(position)
     return position
 
+def cell_centers_from_path(cells, h_lines, v_lines):
+    points = []
+    for (r, c) in cells:
+        x1, x2 = v_lines[c], v_lines[c + 1]
+        y1, y2 = h_lines[r], h_lines[r + 1]
+        points.append(((x1 + x2) // 2, (y1 + y2) // 2))
+    return points
+
+def _sample_bezier(p0, c1, c2, p3, t):
+    mt = 1.0 - t
+    x = (mt*mt*mt)*p0[0] + 3*mt*mt*t*c1[0] + 3*mt*t*t*c2[0] + (t*t*t)*p3[0]
+    y = (mt*mt*mt)*p0[1] + 3*mt*mt*t*c1[1] + 3*mt*t*t*c2[1] + (t*t*t)*p3[1]
+    return (x, y)
+
+def _min_jerk(t):
+    return (10*t*t*t - 15*t*t*t*t + 6*t*t*t*t*t)
+
+def _ease(t):
+    try:
+        return _min_jerk(t) if MIN_JERK else (t*t*(3 - 2*t))
+    except NameError:
+        return (t*t*(3 - 2*t))
+
+def _path_length(points):
+    total = 0.0
+    for i in range(1, len(points)):
+        dx = points[i][0] - points[i-1][0]
+        dy = points[i][1] - points[i-1][1]
+        total += (dx*dx + dy*dy) ** 0.5
+    return total
+
+def _resample_bezier_segments(beziers, step_px=6.0):
+    if not beziers:
+        return []
+    dense = []
+    for (p0, c1, c2, p3) in beziers:
+        approx = (
+            ((p0[0]-p3[0])**2 + (p0[1]-p3[1])**2) ** 0.5 +
+            ((p0[0]-c1[0])**2 + (p0[1]-c1[1])**2) ** 0.5 +
+            ((c2[0]-p3[0])**2 + (c2[1]-p3[1])**2) ** 0.5
+        )
+        samples = max(6, int(approx / max(2.0, step_px)))
+        for i in range(samples):
+            t = i / float(samples)
+            dense.append(_sample_bezier(p0, c1, c2, p3, t))
+    dense.append(beziers[-1][3])
+    return dense
+
+def _cm_bezier_segments(points, tau=0.5):
+    if not points or len(points) == 1:
+        return []
+    if len(points) == 2:
+        p0, p3 = points[0], points[1]
+        c1 = (p0[0] + (p3[0]-p0[0]) * 0.33, p0[1] + (p3[1]-p0[1]) * 0.33)
+        c2 = (p0[0] + (p3[0]-p0[0]) * 0.66, p0[1] + (p3[1]-p0[1]) * 0.66)
+        return [(p0, c1, c2, p3)]
+
+    segs = []
+    pts = [points[0]] + points + [points[-1]]
+    for i in range(1, len(pts) - 2):
+        p0, p1, p2, p3 = pts[i-1], pts[i], pts[i+1], pts[i+2]
+        t1 = ((p2[0] - p0[0]) * tau, (p2[1] - p0[1]) * tau)
+        t2 = ((p3[0] - p1[0]) * tau, (p3[1] - p1[1]) * tau)
+        c1 = (p1[0] + t1[0] / 3.0, p1[1] + t1[1] / 3.0)
+        c2 = (p2[0] - t2[0] / 3.0, p2[1] - t2[1] / 3.0)
+        segs.append((p1, c1, c2, p2))
+    return segs
+
+def _centers_from_cells_absolute(cells, h_lines, v_lines, ox, oy):
+    pts = []
+    for (r, c) in cells:
+        x1, x2 = v_lines[c], v_lines[c + 1]
+        y1, y2 = h_lines[r], h_lines[r + 1]
+        pts.append((ox + (x1 + x2)//2, oy + (y1 + y2)//2))
+    return pts
+
+def human_drag_cells(
+    cells,
+    h_lines,
+    v_lines,
+    *,
+    jitter=True,
+    position_callback=None,
+    progress_callback=None,
+    progress_visualizer=None,
+    color=None,
+    trail_monitor=None
+):
+    ensure_cursor_not_blocked()
+    abort_if_killed()
+
+    if progress_visualizer is not None:
+        ox = getattr(progress_visualizer, "origin_x", 0)
+        oy = getattr(progress_visualizer, "origin_y", 0)
+        hl = getattr(progress_visualizer, "h_lines", h_lines)
+        vl = getattr(progress_visualizer, "v_lines", v_lines)
+    else:
+        ox, oy, hl, vl = 0, 0, h_lines, v_lines
+
+    points = _centers_from_cells_absolute(cells, hl, vl, ox, oy)
+    if not points:
+        return
+
+    beziers = _cm_bezier_segments(points, tau=0.5)
+    dense = _resample_bezier_segments(beziers, step_px=max(6.0, float(PATH_STEP_PX)))
+    total_len = _path_length(dense)
+    time_per_px = float(TIME_PER_PX) / max(0.25, float(SPEED))
+    total_time = max(0.06, min(1.4, total_len * time_per_px))
+    base_steps = max(4, int(STEPS))
+    steps = max(base_steps, int(total_len / 8.0))
+    per_step = max(float(MIN_PER_STEP), total_time / max(1, steps))
+
+    base_noise = (0.35 + JITTER_SCALE * 0.45) if jitter else 0.0
+
+    for i in range(1, len(dense)):
+        abort_if_killed()
+        ensure_cursor_not_blocked()
+
+        t_lin = i / float(len(dense) - 1)
+        t = _ease(t_lin)
+
+        x, y = dense[i]
+        if jitter and base_noise > 0.0 and i < len(dense) - 1:
+            fall = 0.15 + 0.85 * (1.0 - t)
+            x += random.uniform(-base_noise, base_noise) * fall
+            y += random.uniform(-base_noise, base_noise) * fall
+
+        interception.move_to(int(round(x)), int(round(y)))
+
+        if position_callback is not None:
+            try:
+                position_callback(get_cursor_pos())
+            except Exception:
+                pass
+
+        if trail_monitor is not None and progress_visualizer is not None:
+            try:
+                nearest_idx = 0
+                if len(points) > 1:
+                    px, py = x, y
+                    best = 1e18
+                    for idx, (cx, cy) in enumerate(points):
+                        d = (cx - px)*(cx - px) + (cy - py)*(cy - py)
+                        if d < best:
+                            best = d
+                            nearest_idx = idx
+                if 0 <= nearest_idx < len(cells):
+                    trail_monitor.set_context(highlight=cells[nearest_idx])
+            except Exception:
+                pass
+
+        scaled_sleep(per_step)
+
 SEARCH_REGION = {
     "top": 200,
     "left": 400,
@@ -218,52 +382,132 @@ BRIGHT_VALUE_THRESHOLD = 50
 MIN_POINT_PIXELS = 50
 CORE_CROP_RATIO = 0.15
 
+def _unit(vx, vy):
+    mag = (vx*vx + vy*vy) ** 0.5
+    if mag <= 1e-9:
+        return 0.0, 0.0
+    return vx / mag, vy / mag
+
+def _perp(vx, vy):
+    return -vy, vx
+
+def _min_jerk(t):
+    return (10*t*t*t - 15*t*t*t*t + 6*t*t*t*t*t)
+
+def _easing(t):
+    return _min_jerk(t) if MIN_JERK else (t*t*(3 - 2*t))
+
+def _bezier_point(p0, p1, p2, p3, t):
+    mt = 1.0 - t
+    return (
+        mt*mt*mt*p0[0] + 3*mt*mt*t*p1[0] + 3*mt*t*t*p2[0] + t*t*t*p3[0],
+        mt*mt*mt*p0[1] + 3*mt*mt*t*p1[1] + 3*mt*t*t*p2[1] + t*t*t*p3[1],
+    )
+
+def _curved_controls(start, end, curve_strength):
+    sx, sy = start
+    ex, ey = end
+    vx, vy = (ex - sx), (ey - sy)
+    ux, uy = _unit(vx, vy)
+    px, py = _perp(ux, uy)
+    dist = max(1.0, (vx*vx + vy*vy) ** 0.5)
+    base = dist * 0.15 * max(0.0, min(1.0, curve_strength))
+    k1 = (random.uniform(0.6, 1.0) * base) * (1 if random.random() < 0.5 else -1)
+    k2 = (random.uniform(0.6, 1.0) * base) * (1 if random.random() < 0.5 else -1)
+    c1 = (sx + vx * 0.33 + px * k1, sy + vy * 0.33 + py * k1)
+    c2 = (sx + vx * 0.66 + px * k2, sy + vy * 0.66 + py * k2)
+    return c1, c2
+
 def smoothstep(t):
     return t * t * (3 - 2 * t)
 
-def smooth_move_to(target, duration=0.2, jitter=False, position_callback=None):
+def smooth_move_to(target, duration=0.25, jitter=True, position_callback=None):
     ensure_cursor_not_blocked()
     abort_if_killed()
+    import random as _rnd
+    human_curve = globals().get("HUMAN_CURVE", 0.65)
+    step_noise_px = globals().get("STEP_NOISE_PX", 0.6)
+    overshoot_prob = globals().get("OVERSHOOT_PROB", 0.30)
+    overshoot_max = globals().get("OVERSHOOT_MAX_PX", 14)
+    settle_px = globals().get("SETTLE_MICRO_PX", 6)
     start_x, start_y = get_cursor_pos()
+    tx, ty = int(target[0]), int(target[1])
+    dx, dy = (tx - start_x), (ty - start_y)
+    distance = max(1.0, (dx*dx + dy*dy) ** 0.5)
+    smoothness = max(0.2, SMOOTHNESS)
+    base_steps = max(4, int(STEPS))
+    steps = max(base_steps, int((distance / 10.0) * smoothness))
+    per_step = max(0.004, duration / max(1, steps))
+    p0 = (float(start_x), float(start_y))
+    p3 = (float(tx), float(ty))
+    c1, c2 = _curved_controls(p0, p3, human_curve)
+    do_overshoot = (_rnd.random() < overshoot_prob and distance > 25.0)
+    if do_overshoot:
+        ux, uy = _unit(dx, dy)
+        overshoot_len = _rnd.uniform(3.0, overshoot_max)
+        p3_over = (p3[0] + ux * overshoot_len, p3[1] + uy * overshoot_len)
+        c1_over, c2_over = _curved_controls(p0, p3_over, human_curve * 0.9)
+        path_segments = [(p0, c1_over, c2_over, p3_over, int(steps * 0.8)),
+                         (p3_over, * _curved_controls(p3_over, p3, human_curve*0.4), p3, int(steps * 0.2))]
+    else:
+        path_segments = [(p0, c1, c2, p3, steps)]
+
+    base_noise = step_noise_px + (JITTER_SCALE * 0.5 if jitter else 0.0)
+
     if position_callback is not None:
         try:
             position_callback((int(start_x), int(start_y)))
         except Exception:
             pass
-    dx = target[0] - start_x
-    dy = target[1] - start_y
-    distance = max(1.0, (dx**2 + dy**2) ** 0.5)
-    smoothness = max(0.2, SMOOTHNESS)
-    steps = max(4, int((distance / 12) * smoothness))
-    delay = max(0.004, duration / max(1, steps))
-    jitter_amount = max(0.0, JITTER_SCALE) * 0.7
-    for step in range(1, steps + 1):
-        abort_if_killed()
-        ensure_cursor_not_blocked()
-        t = step / steps
-        eased = smoothstep(t)
-        x = start_x + dx * eased
-        y = start_y + dy * eased
-        if jitter and step < steps and jitter_amount > 0:
-            x += random.uniform(-jitter_amount, jitter_amount)
-            y += random.uniform(-jitter_amount, jitter_amount)
-        ix, iy = int(x), int(y)
-        interception.move_to(ix, iy)
-        if position_callback is not None:
-            try:
-                position_callback(get_cursor_pos())
-            except Exception:
-                pass
-        scaled_sleep(delay)
+
+    for (q0, q1, q2, q3, seg_steps) in path_segments:
+        for i in range(1, max(2, seg_steps) + 1):
+            abort_if_killed()
+            ensure_cursor_not_blocked()
+
+            t_lin = i / float(seg_steps)
+            t = _easing(t_lin)
+
+            x, y = _bezier_point(q0, q1, q2, q3, t)
+
+            if jitter and base_noise > 0.0 and i < seg_steps:
+                falloff = 0.2 + 0.8 * (1.0 - t) 
+                x += _rnd.uniform(-base_noise, base_noise) * falloff
+                y += _rnd.uniform(-base_noise, base_noise) * falloff
+
+            interception.move_to(int(round(x)), int(round(y)))
+
+            if position_callback is not None:
+                try:
+                    position_callback(get_cursor_pos())
+                except Exception:
+                    pass
+
+            scaled_sleep(per_step)
+
+    if do_overshoot:
+        for _ in range(2):
+            abort_if_killed()
+            ensure_cursor_not_blocked()
+            nx = tx + _rnd.randint(-settle_px, settle_px)
+            ny = ty + _rnd.randint(-settle_px, settle_px)
+            interception.move_to(int(nx), int(ny))
+            if position_callback is not None:
+                try:
+                    position_callback(get_cursor_pos())
+                except Exception:
+                    pass
+            scaled_sleep(per_step * _rnd.uniform(0.5, 1.0))
+
     abort_if_killed()
     ensure_cursor_not_blocked()
-    tx, ty = int(target[0]), int(target[1])
-    interception.move_to(tx, ty)
+    interception.move_to(int(tx), int(ty))
     if position_callback is not None:
         try:
             position_callback(get_cursor_pos())
         except Exception:
             pass
+
 
 TOLERANCE = 0
 def color_match(pixel, target, tol=TOLERANCE):
@@ -1479,34 +1723,27 @@ def drag_path(
         if total_steps:
             send_progress(1)
             record_point(force=True)
-        for i in range(len(centers) - 1):
-            abort_if_killed()
-            segment = interpolate_segment(centers[i], centers[i + 1], steps=10)
-            target_index = min(i + 1, len(cells) - 1)
-            for px, py in segment:
-                abort_if_killed()
-                interception.move_to(int(px), int(py))
-                current_highlight_cell = cells[target_index]
-                if use_monitor:
-                    trail_monitor.set_context(highlight=current_highlight_cell)
-                record_point()
-                scaled_sleep(0.0025 + random.uniform(-0.0005, 0.0005))
-            if total_steps:
-                send_progress(i + 2)
-                record_point(force=True)
-            if i < len(centers) - 2:
-                abort_if_killed()
-                dx1 = centers[i + 1][0] - centers[i][0]
-                dy1 = centers[i + 1][1] - centers[i][1]
-                dx2 = centers[i + 2][0] - centers[i + 1][0]
-                dy2 = centers[i + 2][1] - centers[i + 1][1]
-                if (dx1, dy1) != (dx2, dy2):
-                    scaled_sleep(random.uniform(0.02, 0.04))
-            if random.random() < 0.15:
-                scaled_sleep(random.uniform(0.01, 0.03))
+
+        human_drag_cells(
+            cells,
+            h_lines=getattr(progress_visualizer, "h_lines", []),
+            v_lines=getattr(progress_visualizer, "v_lines", []),
+            jitter=True,
+            position_callback=trail_callback,
+            progress_callback=progress_callback,
+            progress_visualizer=progress_visualizer,
+            color=color,
+            trail_monitor=trail_monitor
+        )
+
+        if total_steps:
+            send_progress(total_steps)
+            record_point(force=True)
+
         if hold:
             scaled_sleep(0.01)
             abort_if_killed()
+
     finally:
         if progress_visualizer is not None:
             final_cell = cells[-1] if cells else current_highlight_cell
