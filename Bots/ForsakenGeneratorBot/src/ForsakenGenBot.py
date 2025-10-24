@@ -5,6 +5,7 @@ import numpy as np
 import pyautogui
 import keyboard
 from collections import deque
+from contextlib import contextmanager, nullcontext
 from threading import Event, Thread, RLock
 from typing import Optional
 import interception
@@ -108,25 +109,59 @@ def get_kill_switch_key():
     return KILL_SWITCH_KEY
 
 _register_kill_switch_hotkey()
-SPEED = 0.95
-JITTER_SCALE = 0.6
-SMOOTHNESS = 0.55
-STEPS = 7
-HUMAN_CURVE = 0.65
-STEP_NOISE_PX = 0.6
-OVERSHOOT_PROB = 0.30
-OVERSHOOT_MAX_PX = 14
-SETTLE_MICRO_PX = 6
-MIN_JERK = True
-PATH_STEP_PX = 14.0
-TIME_PER_PX  = 0.0011
-MIN_PER_STEP = 0.0020
+SPEED = 1.35
+JITTER_SCALE = 0.8
+SMOOTHNESS = 0.75
+STEPS = 5
 AUTO_IDLE_DELAY = 0.5
 MOUSE_STALL_TIMEOUT = 10
 BLOCKED_CURSOR_POSITIONS = {
     (960, 540),
     (960, 527),
 }
+_blocked_cursor_lock = RLock()
+_blocked_cursor_whitelist_stack = []
+@contextmanager
+def _whitelist_blocked_positions(positions):
+    normalized = {
+        (int(pos[0]), int(pos[1]))
+        for pos in positions
+        if isinstance(pos, (tuple, list)) and len(pos) == 2
+    }
+    if not normalized:
+        yield
+        return
+    with _blocked_cursor_lock:
+        _blocked_cursor_whitelist_stack.append(normalized)
+    try:
+        yield
+    finally:
+        with _blocked_cursor_lock:
+            if _blocked_cursor_whitelist_stack and _blocked_cursor_whitelist_stack[-1] is normalized:
+                _blocked_cursor_whitelist_stack.pop()
+            else:
+                try:
+                    _blocked_cursor_whitelist_stack.remove(normalized)
+                except ValueError:
+                    pass
+
+def _is_blocked_position_whitelisted(position):
+    normalized = (int(position[0]), int(position[1]))
+    with _blocked_cursor_lock:
+        for allowed in reversed(_blocked_cursor_whitelist_stack):
+            if normalized in allowed:
+                return True
+    return False
+
+HUMAN_CURVE = 0.65
+STEP_NOISE_PX = 0.6
+OVERSHOOT_PROB = 0.30
+OVERSHOOT_MAX_PX = 12
+SETTLE_MICRO_PX = 6
+MIN_JERK = True
+PATH_STEP_PX = 14.0
+TIME_PER_PX  = 0.00055
+MIN_PER_STEP = 0.0010 
 
 def set_speed(value):
     global SPEED
@@ -134,6 +169,45 @@ def set_speed(value):
         SPEED = max(0.1, float(value))
     except (TypeError, ValueError):
         pass
+
+def _speed_factor():
+    return 1.0 / max(0.1, float(SPEED))
+
+def scaled_sleep(base_time):
+    total = max(0.0, float(base_time) * _speed_factor())
+    if total <= 0:
+        abort_if_killed()
+        return
+    deadline = time.time() + total
+    while True:
+        abort_if_killed()
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            break
+        time.sleep(min(0.05, remaining))
+    abort_if_killed()
+
+def time_for_distance(px, base_time_per_px=None, *, clamp=(0.04, 2.2)):
+    if base_time_per_px is None:
+        base_time_per_px = float(globals().get("TIME_PER_PX", 0.0011))
+    px = max(0.0, float(px))
+    t = px * base_time_per_px * _speed_factor()
+    lo, hi = clamp
+    return max(lo, min(hi, t))
+
+def steps_for_distance(px, *, density_px=None, base_steps=None):
+    if density_px is None:
+        density_px = float(globals().get("PATH_STEP_PX", 14.0))
+    if base_steps is None:
+        base_steps = max(4, int(globals().get("STEPS", 7)))
+    px = max(0.0, float(px))
+    return max(base_steps, int(px / max(2.0, density_px)))
+
+def per_step_delay(total_time, steps, *, min_per_step=None):
+    if min_per_step is None:
+        min_per_step = float(globals().get("MIN_PER_STEP", 0.0020))
+    steps = max(1, int(steps))
+    return max(min_per_step * _speed_factor(), float(total_time) / steps)
 
 def set_jitter_scale(value):
     global JITTER_SCALE
@@ -156,20 +230,6 @@ def get_settings():
         'smoothness': SMOOTHNESS,
     }
 
-def scaled_sleep(base_time):
-    total = max(0.0, base_time * SPEED)
-    if total <= 0:
-        abort_if_killed()
-        return
-    deadline = time.time() + total
-    while True:
-        abort_if_killed()
-        remaining = deadline - time.time()
-        if remaining <= 0:
-            break
-        time.sleep(min(0.05, remaining))
-    abort_if_killed()
-
 def move_to(x, y):
     ensure_cursor_not_blocked()
     abort_if_killed()
@@ -189,7 +249,7 @@ def click(x=None, y=None, button="left", delay=0.05):
     abort_if_killed()
     if x is None or y is None:
         x, y = get_cursor_pos()
-    interception.click(int(x), int(y), button=button, delay=delay)
+    interception.click(int(x), int(y), button=button, delay=max(0.0, float(delay) * _speed_factor()))
 
 def get_cursor_pos():
     pt = ctypes.wintypes.POINT()
@@ -197,10 +257,15 @@ def get_cursor_pos():
     return pt.x, pt.y
 
 def handle_blocked_cursor(position):
-    print(f"Blocked cursor detected at {tuple(int(v) for v in position)}. Custom handler invoked.")
+    normalized = tuple(int(v) for v in position)
+    if get_puzzle_monitor() is not None and _is_blocked_position_whitelisted(normalized):
+        print(f"Blocked cursor at {normalized} is whitelisted during puzzle execution; ignoring auto-close.")
+        return True
+    print(f"Blocked cursor detected at {normalized}. Custom handler invoked.")
     interception.key_down("w")
     time.sleep(0.2)
     interception.key_up("w")
+    return False
 
 def is_blocked_cursor_position(position):
     try:
@@ -212,7 +277,8 @@ def is_blocked_cursor_position(position):
 def ensure_cursor_not_blocked():
     position = get_cursor_pos()
     if is_blocked_cursor_position(position):
-        handle_blocked_cursor(position)
+        if handle_blocked_cursor(position):
+            return position
         raise MouseBlockedAtStart(position)
     return position
 
@@ -314,60 +380,59 @@ def human_drag_cells(
         vl = getattr(progress_visualizer, "v_lines", v_lines)
     else:
         ox, oy, hl, vl = 0, 0, h_lines, v_lines
-
     points = _centers_from_cells_absolute(cells, hl, vl, ox, oy)
     if not points:
         return
-
     beziers = _cm_bezier_segments(points, tau=0.5)
-    dense = _resample_bezier_segments(beziers, step_px=max(6.0, float(PATH_STEP_PX)))
+    step_px = float(globals().get("PATH_STEP_PX", 14.0))
+    dense = _resample_bezier_segments(beziers, step_px=max(6.0, step_px))
     total_len = _path_length(dense)
-    time_per_px = float(TIME_PER_PX) / max(0.25, float(SPEED))
-    total_time = max(0.06, min(1.4, total_len * time_per_px))
-    base_steps = max(4, int(STEPS))
-    steps = max(base_steps, int(total_len / 8.0))
-    per_step = max(float(MIN_PER_STEP), total_time / max(1, steps))
-
+    total_time = time_for_distance(total_len, base_time_per_px=float(globals().get("TIME_PER_PX", 0.0011)),
+                                   clamp=(0.06, 1.8))
+    steps = steps_for_distance(total_len, density_px=step_px, base_steps=max(4, int(globals().get("STEPS", 7))))
+    per_step = per_step_delay(total_time, steps, min_per_step=float(globals().get("MIN_PER_STEP", 0.0020)))
     base_noise = (0.35 + JITTER_SCALE * 0.45) if jitter else 0.0
+    dense_int_positions = {(int(round(px)), int(round(py))) for px, py in dense}
+    whitelist_positions = BLOCKED_CURSOR_POSITIONS.intersection(dense_int_positions)
+    whitelist_ctx = _whitelist_blocked_positions(whitelist_positions) if whitelist_positions else nullcontext()
 
-    for i in range(1, len(dense)):
-        abort_if_killed()
-        ensure_cursor_not_blocked()
+    with whitelist_ctx:
+        for i in range(1, len(dense)):
+            abort_if_killed()
+            ensure_cursor_not_blocked()
 
-        t_lin = i / float(len(dense) - 1)
-        t = _ease(t_lin)
+            t = _ease(i / float(len(dense) - 1))
+            x, y = dense[i]
 
-        x, y = dense[i]
-        if jitter and base_noise > 0.0 and i < len(dense) - 1:
-            fall = 0.15 + 0.85 * (1.0 - t)
-            x += random.uniform(-base_noise, base_noise) * fall
-            y += random.uniform(-base_noise, base_noise) * fall
+            if jitter and base_noise > 0.0 and i < len(dense) - 1:
+                fall = 0.15 + 0.85 * (1.0 - t)
+                x += random.uniform(-base_noise, base_noise) * fall
+                y += random.uniform(-base_noise, base_noise) * fall
 
-        interception.move_to(int(round(x)), int(round(y)))
+            interception.move_to(int(round(x)), int(round(y)))
 
-        if position_callback is not None:
-            try:
-                position_callback(get_cursor_pos())
-            except Exception:
-                pass
+            if position_callback is not None:
+                try:
+                    position_callback(get_cursor_pos())
+                except Exception:
+                    pass
 
-        if trail_monitor is not None and progress_visualizer is not None:
-            try:
-                nearest_idx = 0
-                if len(points) > 1:
+            if trail_monitor is not None and progress_visualizer is not None:
+                try:
                     px, py = x, y
-                    best = 1e18
-                    for idx, (cx, cy) in enumerate(points):
-                        d = (cx - px)*(cx - px) + (cy - py)*(cy - py)
-                        if d < best:
-                            best = d
-                            nearest_idx = idx
-                if 0 <= nearest_idx < len(cells):
-                    trail_monitor.set_context(highlight=cells[nearest_idx])
-            except Exception:
-                pass
+                    nearest_idx = 0
+                    if len(points) > 1:
+                        best = 1e18
+                        for idx, (cx, cy) in enumerate(points):
+                            d = (cx - px)*(cx - px) + (cy - py)*(cy - py)
+                            if d < best:
+                                best = d; nearest_idx = idx
+                    if 0 <= nearest_idx < len(cells):
+                        trail_monitor.set_context(highlight=cells[nearest_idx])
+                except Exception:
+                    pass
 
-        scaled_sleep(per_step)
+            scaled_sleep(per_step)
 
 SEARCH_REGION = {
     "top": 200,
@@ -421,9 +486,10 @@ def _curved_controls(start, end, curve_strength):
 def smoothstep(t):
     return t * t * (3 - 2 * t)
 
-def smooth_move_to(target, duration=0.25, jitter=True, position_callback=None):
+def smooth_move_to(target, duration=None, jitter=True, position_callback=None):
     ensure_cursor_not_blocked()
     abort_if_killed()
+
     import random as _rnd
     human_curve = globals().get("HUMAN_CURVE", 0.65)
     step_noise_px = globals().get("STEP_NOISE_PX", 0.6)
@@ -434,10 +500,12 @@ def smooth_move_to(target, duration=0.25, jitter=True, position_callback=None):
     tx, ty = int(target[0]), int(target[1])
     dx, dy = (tx - start_x), (ty - start_y)
     distance = max(1.0, (dx*dx + dy*dy) ** 0.5)
-    smoothness = max(0.2, SMOOTHNESS)
-    base_steps = max(4, int(STEPS))
-    steps = max(base_steps, int((distance / 10.0) * smoothness))
-    per_step = max(0.004, duration / max(1, steps))
+    if duration is None:
+        duration = time_for_distance(distance, clamp=(0.06, 1.6))
+    steps = steps_for_distance(distance, density_px=globals().get("PATH_STEP_PX", 14.0),
+                               base_steps=max(4, int(globals().get("STEPS", 7))))
+    per_step = per_step_delay(duration, steps)
+
     p0 = (float(start_x), float(start_y))
     p3 = (float(tx), float(ty))
     c1, c2 = _curved_controls(p0, p3, human_curve)
@@ -447,66 +515,68 @@ def smooth_move_to(target, duration=0.25, jitter=True, position_callback=None):
         overshoot_len = _rnd.uniform(3.0, overshoot_max)
         p3_over = (p3[0] + ux * overshoot_len, p3[1] + uy * overshoot_len)
         c1_over, c2_over = _curved_controls(p0, p3_over, human_curve * 0.9)
-        path_segments = [(p0, c1_over, c2_over, p3_over, int(steps * 0.8)),
-                         (p3_over, * _curved_controls(p3_over, p3, human_curve*0.4), p3, int(steps * 0.2))]
+        path_segments = [
+            (p0, c1_over, c2_over, p3_over, int(steps * 0.8)),
+            (p3_over, * _curved_controls(p3_over, p3, human_curve*0.4), p3, int(steps * 0.2))
+        ]
     else:
         path_segments = [(p0, c1, c2, p3, steps)]
-
     base_noise = step_noise_px + (JITTER_SCALE * 0.5 if jitter else 0.0)
-
+    planned_positions = set()
+    for (q0, q1, q2, q3, seg_steps) in path_segments:
+        seg_count = max(2, int(seg_steps))
+        for i in range(1, seg_count + 1):
+            t = _easing(i / float(seg_count))
+            x, y = _bezier_point(q0, q1, q2, q3, t)
+            planned_positions.add((int(round(x)), int(round(y))))
+    whitelist_positions = planned_positions.intersection(BLOCKED_CURSOR_POSITIONS)
     if position_callback is not None:
         try:
             position_callback((int(start_x), int(start_y)))
         except Exception:
             pass
 
-    for (q0, q1, q2, q3, seg_steps) in path_segments:
-        for i in range(1, max(2, seg_steps) + 1):
-            abort_if_killed()
-            ensure_cursor_not_blocked()
+    whitelist_ctx = _whitelist_blocked_positions(whitelist_positions) if whitelist_positions else nullcontext()
+    with whitelist_ctx:
+        for (q0, q1, q2, q3, seg_steps) in path_segments:
+            seg_steps = max(2, int(seg_steps))
+            for i in range(1, seg_steps + 1):
+                abort_if_killed()
+                ensure_cursor_not_blocked()
+                t = _easing(i / float(seg_steps))
+                x, y = _bezier_point(q0, q1, q2, q3, t)
+                if jitter and base_noise > 0.0 and i < seg_steps:
+                    falloff = 0.2 + 0.8 * (1.0 - t)
+                    x += _rnd.uniform(-base_noise, base_noise) * falloff
+                    y += _rnd.uniform(-base_noise, base_noise) * falloff
+                interception.move_to(int(round(x)), int(round(y)))
+                if position_callback is not None:
+                    try:
+                        position_callback(get_cursor_pos())
+                    except Exception:
+                        pass
+                scaled_sleep(per_step)
 
-            t_lin = i / float(seg_steps)
-            t = _easing(t_lin)
+        if do_overshoot:
+            for _ in range(2):
+                abort_if_killed(); ensure_cursor_not_blocked()
+                nx = tx + _rnd.randint(-settle_px, settle_px)
+                ny = ty + _rnd.randint(-settle_px, settle_px)
+                interception.move_to(int(nx), int(ny))
+                if position_callback is not None:
+                    try:
+                        position_callback(get_cursor_pos())
+                    except Exception:
+                        pass
+                scaled_sleep(per_step * _speed_factor())
 
-            x, y = _bezier_point(q0, q1, q2, q3, t)
-
-            if jitter and base_noise > 0.0 and i < seg_steps:
-                falloff = 0.2 + 0.8 * (1.0 - t) 
-                x += _rnd.uniform(-base_noise, base_noise) * falloff
-                y += _rnd.uniform(-base_noise, base_noise) * falloff
-
-            interception.move_to(int(round(x)), int(round(y)))
-
-            if position_callback is not None:
-                try:
-                    position_callback(get_cursor_pos())
-                except Exception:
-                    pass
-
-            scaled_sleep(per_step)
-
-    if do_overshoot:
-        for _ in range(2):
-            abort_if_killed()
-            ensure_cursor_not_blocked()
-            nx = tx + _rnd.randint(-settle_px, settle_px)
-            ny = ty + _rnd.randint(-settle_px, settle_px)
-            interception.move_to(int(nx), int(ny))
-            if position_callback is not None:
-                try:
-                    position_callback(get_cursor_pos())
-                except Exception:
-                    pass
-            scaled_sleep(per_step * _rnd.uniform(0.5, 1.0))
-
-    abort_if_killed()
-    ensure_cursor_not_blocked()
-    interception.move_to(int(tx), int(ty))
-    if position_callback is not None:
-        try:
-            position_callback(get_cursor_pos())
-        except Exception:
-            pass
+        abort_if_killed(); ensure_cursor_not_blocked()
+        interception.move_to(int(tx), int(ty))
+        if position_callback is not None:
+            try:
+                position_callback(get_cursor_pos())
+            except Exception:
+                pass
 
 
 TOLERANCE = 0
@@ -1680,7 +1750,7 @@ def drag_path(
     trail_callback = (lambda pos: record_point(pos)) if progress_visualizer is not None else None
     smooth_move_to(
         centers[0],
-        duration=0.15 * SPEED,
+        duration=None,
         jitter=False,
         position_callback=trail_callback,
     )
