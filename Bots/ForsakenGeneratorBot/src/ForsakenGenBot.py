@@ -109,7 +109,7 @@ def get_kill_switch_key():
     return KILL_SWITCH_KEY
 
 _register_kill_switch_hotkey()
-SPEED = 1.35
+SPEED = 1.5
 JITTER_SCALE = 0.8
 SMOOTHNESS = 0.75
 STEPS = 5
@@ -187,13 +187,20 @@ def scaled_sleep(base_time):
         time.sleep(min(0.05, remaining))
     abort_if_killed()
 
-def time_for_distance(px, base_time_per_px=None, *, clamp=(0.04, 2.2)):
+def is_trivial_drag(px: float) -> bool:
+    px = max(0.0, float(px))
+    return px <= max(6.0, float(globals().get("PATH_STEP_PX", 14.0)) * 1.2)
+
+def time_for_distance(px, base_time_per_px=None, *, clamp=(0.0, 1.8)):
     if base_time_per_px is None:
         base_time_per_px = float(globals().get("TIME_PER_PX", 0.0011))
     px = max(0.0, float(px))
-    t = px * base_time_per_px * _speed_factor()
-    lo, hi = clamp
-    return max(lo, min(hi, t))
+    if is_trivial_drag(px):
+        t = px * base_time_per_px * 0.35 * (1.0 / max(0.1, float(SPEED)))
+        return max(0.0, t)
+    t = px * base_time_per_px * (1.0 / max(0.1, float(SPEED)))
+    _lo, hi = clamp
+    return min(hi, t)
 
 def steps_for_distance(px, *, density_px=None, base_steps=None):
     if density_px is None:
@@ -207,7 +214,9 @@ def per_step_delay(total_time, steps, *, min_per_step=None):
     if min_per_step is None:
         min_per_step = float(globals().get("MIN_PER_STEP", 0.0020))
     steps = max(1, int(steps))
-    return max(min_per_step * _speed_factor(), float(total_time) / steps)
+    if total_time <= 0.004:
+        return max(0.0, float(total_time) / steps)
+    return max(min_per_step * (1.0 / max(0.1, float(SPEED))), float(total_time) / steps)
 
 def set_jitter_scale(value):
     global JITTER_SCALE
@@ -1699,6 +1708,38 @@ def drag_path(
     if not centers or len(centers) < 2:
         return
     abort_if_killed()
+    def _length_over_points(pts):
+        tot = 0.0
+        for i in range(len(pts) - 1):
+            dx = float(pts[i + 1][0] - pts[i][0])
+            dy = float(pts[i + 1][1] - pts[i][1])
+            tot += (dx * dx + dy * dy) ** 0.5
+        return tot
+    PATH_STEP = float(globals().get("PATH_STEP_PX", 14.0))
+    def _is_trivial(px):
+        if "is_trivial_drag" in globals():
+            try:
+                return bool(globals()["is_trivial_drag"](px))
+            except Exception:
+                pass
+        return px <= max(6.0, PATH_STEP * 1.2)
+
+    def _time_for_distance(px):
+        if "time_for_distance" in globals():
+            return globals()["time_for_distance"](px, base_time_per_px=float(globals().get("TIME_PER_PX", 0.0011)),
+                                                  clamp=(0.0, 1.8))
+        t = max(0.0, float(px)) * float(globals().get("TIME_PER_PX", 0.0011))
+        sp = max(0.1, float(globals().get("SPEED", 1.0)))
+        return t / sp
+
+    def _per_step_delay(total_time, steps):
+        if "per_step_delay" in globals():
+            return globals()["per_step_delay"](total_time, steps, min_per_step=float(globals().get("MIN_PER_STEP", 0.0020)))
+        steps = max(1, int(steps))
+        min_ps = float(globals().get("MIN_PER_STEP", 0.0020))
+        sp = max(0.1, float(globals().get("SPEED", 1.0)))
+        return max(min_ps / sp, float(total_time) / steps)
+
     current_highlight_cell = cells[0] if cells else None
     last_progress_label = None
     use_monitor = (
@@ -1748,6 +1789,7 @@ def drag_path(
         trail_monitor.set_context(color=color, highlight=current_highlight_cell, label=None)
 
     trail_callback = (lambda pos: record_point(pos)) if progress_visualizer is not None else None
+
     smooth_move_to(
         centers[0],
         duration=None,
@@ -1755,64 +1797,118 @@ def drag_path(
         position_callback=trail_callback,
     )
     record_point(force=True)
-    scaled_sleep(0.01)
+
+    total_len_px = _length_over_points(centers)
+    is_trivial = _is_trivial(total_len_px)
+
+    if not is_trivial:
+        scaled_sleep(0.008)
+
     mouse_is_down = False
     try:
         if hold:
             abort_if_killed()
             mouse_down()
             mouse_is_down = True
-            scaled_sleep(0.005)
-        total_steps = len(cells) if cells else 0
+            if not is_trivial:
+                scaled_sleep(0.003)
 
-        def send_progress(step_index):
-            nonlocal last_progress_label, current_highlight_cell
-            if (
-                progress_callback is None
-                or progress_visualizer is None
-                or not cells
-                or step_index <= 0
-                or step_index > total_steps
-            ):
-                return
-            cell = cells[step_index - 1]
-            progress_visualizer.mark_cell(cell, color)
-            label = f"{color}: {step_index}/{total_steps}"
-            frame = progress_visualizer.snapshot(current_cell=cell, current_color=color, label=label)
-            try:
-                progress_callback(f"path_progress|{color}|{step_index}|{total_steps}", frame)
-            except Exception:
-                pass
-            last_progress_label = label
-            current_highlight_cell = cell
-            if use_monitor:
-                trail_monitor.set_context(highlight=current_highlight_cell, label=label)
-            else:
-                emit_snapshot(label=label, force=True)
-
-        if total_steps:
-            send_progress(1)
-            record_point(force=True)
-
-        human_drag_cells(
-            cells,
-            h_lines=getattr(progress_visualizer, "h_lines", []),
-            v_lines=getattr(progress_visualizer, "v_lines", []),
-            jitter=True,
-            position_callback=trail_callback,
-            progress_callback=progress_callback,
-            progress_visualizer=progress_visualizer,
-            color=color,
-            trail_monitor=trail_monitor
+        can_humanize = (
+            (not is_trivial)
+            and ("human_drag_cells" in globals())
+            and callable(globals().get("human_drag_cells"))
+            and (progress_visualizer is not None)
+            and hasattr(progress_visualizer, "h_lines")
+            and hasattr(progress_visualizer, "v_lines")
         )
 
-        if total_steps:
-            send_progress(total_steps)
-            record_point(force=True)
+        if can_humanize:
+            try:
+                globals()["human_drag_cells"](
+                    cells,
+                    getattr(progress_visualizer, "h_lines"),
+                    getattr(progress_visualizer, "v_lines"),
+                    jitter=True,
+                    position_callback=trail_callback,
+                    progress_callback=progress_callback,
+                    progress_visualizer=progress_visualizer,
+                    color=color,
+                    trail_monitor=trail_monitor,
+                )
+            except Exception:
+                can_humanize = False
 
-        if hold:
-            scaled_sleep(0.01)
-            abort_if_killed()
+        if not can_humanize:
+            total_steps = len(cells) if cells else 0
+
+            def send_progress(step_index):
+                nonlocal last_progress_label, current_highlight_cell
+                if (
+                    progress_callback is None
+                    or progress_visualizer is None
+                    or not cells
+                    or step_index <= 0
+                    or step_index > total_steps
+                ):
+                    return
+                cell = cells[step_index - 1]
+                progress_visualizer.mark_cell(cell, color)
+                label = f"{color}: {step_index}/{total_steps}"
+                frame = progress_visualizer.snapshot(current_cell=cell, current_color=color, label=label)
+                try:
+                    progress_callback(f"path_progress|{color}|{step_index}|{total_steps}", frame)
+                except Exception:
+                    pass
+                last_progress_label = label
+                current_highlight_cell = cell
+                if use_monitor:
+                    trail_monitor.set_context(highlight=current_highlight_cell, label=label)
+                else:
+                    emit_snapshot(label=label, force=True)
+
+            if total_steps:
+                send_progress(1)
+                record_point(force=True)
+
+            planned_points = 0
+            segments = []
+            seg_steps = int(globals().get("STEPS", 8))
+            for i in range(len(centers) - 1):
+                seg = interpolate_segment(centers[i], centers[i + 1], steps=seg_steps)
+                segments.append(seg)
+                planned_points += len(seg)
+
+            total_time = _time_for_distance(total_len_px)
+            per_step = 0.0 if is_trivial else _per_step_delay(total_time, max(1, planned_points))
+
+            for i, segment in enumerate(segments):
+                target_index = min(i + 1, len(cells) - 1)
+                for px, py in segment:
+                    abort_if_killed()
+                    interception.move_to(int(px), int(py))
+                    current_highlight_cell = cells[target_index]
+                    if use_monitor:
+                        trail_monitor.set_context(highlight=current_highlight_cell)
+                    record_point()
+                    if per_step > 0.0:
+                        scaled_sleep(per_step * (0.95 + random.uniform(-0.05, 0.05)))
+                if total_steps:
+                    send_progress(i + 2)
+                    record_point(force=True)
+
+                if (i < len(centers) - 2) and (not is_trivial):
+                    dx1 = centers[i + 1][0] - centers[i][0]
+                    dy1 = centers[i + 1][1] - centers[i][1]
+                    dx2 = centers[i + 2][0] - centers[i + 1][0]
+                    dy2 = centers[i + 2][1] - centers[i + 1][1]
+                    if (dx1, dy1) != (dx2, dy2):
+                        scaled_sleep(random.uniform(0.012, 0.028))
+                if (not is_trivial) and (random.random() < 0.12):
+                    scaled_sleep(random.uniform(0.006, 0.016))
+
+        if hold and not is_trivial:
+            scaled_sleep(0.006)
+        abort_if_killed()
 
     finally:
         if progress_visualizer is not None:
