@@ -599,88 +599,13 @@ def capture_region():
     ))
     return cv2.cvtColor(np.array(screenshot), cv2.COLOR_RGB2BGR)
 
-def _safe_debug(msg):
-    try:
-        debug_log(msg)
-    except Exception:
-        print(msg)
-
 def find_puzzle_bbox(img):
-    import numpy as np
-    import cv2
-    if img is None or img.size == 0:
-        raise PuzzleNotAvailable("Empty image passed to find_puzzle_bbox")
-
-    h, w = img.shape[:2]
-    _safe_debug(f"[Grid] find_puzzle_bbox | image shape={img.shape}")
-
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    blur = cv2.GaussianBlur(gray, (5, 5), 0)
-    edges = cv2.Canny(blur, 40, 120)
-    row_proj = edges.sum(axis=1).astype(np.float32)
-    col_proj = edges.sum(axis=0).astype(np.float32)
-    row_max = float(row_proj.max() if row_proj.size else 0.0)
-    col_max = float(col_proj.max() if col_proj.size else 0.0)
-
-    if row_max <= 0 or col_max <= 0:
-        raise PuzzleNotAvailable("No edge structure detected in screenshot")
-
-    ROW_FRAC = 0.18
-    COL_FRAC = 0.18
-
-    row_idxs = np.where(row_proj >= row_max * ROW_FRAC)[0]
-    col_idxs = np.where(col_proj >= col_max * COL_FRAC)[0]
-
-    if row_idxs.size < 6 or col_idxs.size < 6:
-        _safe_debug(f"[Grid] Too few row/col edge strips ({row_idxs.size}, {col_idxs.size})")
-        raise PuzzleNotAvailable("Grid not found")
-
-    def pick_main_cluster(idxs, max_gap_ratio=0.15):
-        if idxs.size == 0:
-            return None
-
-        gaps = np.diff(idxs)
-        if gaps.size == 0:
-            return int(idxs[0]), int(idxs[-1])
-
-        span = max(1, int(idxs[-1] - idxs[0]))
-        gap_limit = max(2, int(span * max_gap_ratio))
-
-        cluster_starts = [0]
-        for i, g in enumerate(gaps):
-            if g > gap_limit:
-                cluster_starts.append(i + 1)
-        cluster_starts.append(len(idxs))
-
-        best_len = -1
-        best = (int(idxs[0]), int(idxs[-1]))
-
-        for s, e in zip(cluster_starts[:-1], cluster_starts[1:]):
-            if e <= s:
-                continue
-            length = idxs[e - 1] - idxs[s]
-            if length > best_len:
-                best_len = length
-                best = (int(idxs[s]), int(idxs[e - 1]))
-
-        return best
-
-    top, bottom = pick_main_cluster(row_idxs)
-    left, right = pick_main_cluster(col_idxs)
-    pad_y = int(0.01 * h)
-    pad_x = int(0.01 * w)
-    top = max(0, top - pad_y)
-    left = max(0, left - pad_x)
-    bottom = min(h - 1, bottom + pad_y)
-    right = min(w - 1, right + pad_x)
-
-    if (right - left) < 40 or (bottom - top) < 40:
-        _safe_debug(f"[Grid] Puzzle bbox too small: ({left},{top})–({right},{bottom})")
-        raise PuzzleNotAvailable("Detected puzzle area too small")
-
-    _safe_debug(f"[Grid] Puzzle bbox detected: left={left}, top={top}, right={right}, bottom={bottom}")
-
-    return (left, top, right, bottom)
+    mask_black = cv2.inRange(img, (0, 0, 0), (0, 0, 0))
+    contours, _ = cv2.findContours(mask_black, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return None
+    largest = max(contours, key=cv2.contourArea)
+    return cv2.boundingRect(largest)
 
 class MouseMovementMonitor:
     def __init__(self, idle_timeout=1.0):
