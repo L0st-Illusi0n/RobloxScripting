@@ -1,0 +1,6 @@
+cffi==2.0.0
+interception==0.6.0
+keyboard==0.13.5
+mss==10.1.0
+nuitka==2.8.1
+numpy==2.2.6

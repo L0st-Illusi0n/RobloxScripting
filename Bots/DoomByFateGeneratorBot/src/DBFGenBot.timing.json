@@ -1,0 +1,6 @@
+{
+  "wire_speed": 4.0,
+  "cord_speed": 1.1,
+  "wire_grab_delay": 0.05,
+  "cord_grab_delay": 0.15
+}
