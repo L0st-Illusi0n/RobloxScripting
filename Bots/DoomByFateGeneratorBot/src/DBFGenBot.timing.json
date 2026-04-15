@@ -1,6 +1,6 @@
 {
-  "wire_speed": 4.0,
-  "cord_speed": 1.1,
-  "wire_grab_delay": 0.05,
-  "cord_grab_delay": 0.15
+  "wire_speed": 4.0, "//": "Multiplier For Main Movement Speed",
+  "cord_speed": 1.1, "//": "1.1 Is Maximum Cord Speed The Game Will Register",
+  "wire_grab_delay": 0.05, "//": "Seconds Before Actually Moving The Wire (To Prevent Not Registering Properly)",
+  "cord_grab_delay": 0.15, "//": "Same As Above But With The Cord"
 }
